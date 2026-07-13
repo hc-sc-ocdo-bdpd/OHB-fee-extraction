@@ -1,0 +1,30 @@
+# Project data - never push source/output data files
+Data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# Microsoft Office temp/lock files
+~$*.xlsx
+~$*.xls
+~$*.xlsm
+~$*.docx
+~$*.doc
+~$*.pptx
+*.tmp
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
