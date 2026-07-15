@@ -3,78 +3,74 @@ Consolidate CDCP price file data and PT (provincial/territorial) association fee
 guide data into a "Fee Comparison" workbook, matching the shape of
 Data/Output_2026 Fee Comparison/2026 Fee Comparisons v2.xlsx.
 
-Current scope: Ontario (ON), Dental Hygienist (DH) only.
+Current scope: Dental Hygienist (DH), all provinces/territories that have a
+DH sheet in their CDCP price file (AB, BC, MB, NB, NL, NS, ON, PE, QC, SK --
+NT, NU, YT have no CDCP DH data at all, matching the template).
 
-Inputs:
-  - Data/Input_CDCP price files/2026 - CDCP PRICE FILE - ON.xlsx
-  - Data/Input_PT association fee guides/DH/ON DH Fee Guide 2026.xlsx  (primary PT fee source)
-  - Data/Input_PT association fee guides/DH/ON DH Fee Guide 2026.pdf  (cross-check only)
+For each province, PT fees are resolved from whatever fee-guide file(s)
+actually exist for that province/specialty (see scripts/fee_extraction.py):
+xlsx/xlsm/xls spreadsheets first, then csv, then docx, then pdf -- trying
+each in turn and filling in only the codes still missing at each step, so
+multiple partial sources combine. A province with no fee guide file at all
+(e.g. SK, NS for DH) gets "N/A" PT fees throughout, same as the template.
 
-Notes on known gaps (see conversation / README at top of repo for rationale):
-  - Neither input file contains 2025 fees, so '2025 CDCP Fee' and '2025 PT Fee'
-    are written as "N/A".
-  - CDCP claim-count data (used to compute weighted increases in columns I-Y)
-    is not available from these three files, so claim-count columns (L, O, P)
-    are written as 0. The formulas are still written so the workbook is ready
-    to be populated with real claim counts later.
+Known gaps:
+  - None of the input files contain 2025 fees, so '2025 CDCP Fee' and
+    '2025 PT Fee' are written as "N/A".
+  - CDCP claim-count data (used to compute weighted increases in columns
+    I-Y) is not available from these files, so claim-count columns (L, O, P)
+    are written as 0. The formulas are still written so the workbook is
+    ready to be populated with real claim counts later.
 
 Output:
   - Data/Output_2026 Fee Comparison/2026 Fee Comparisons - generated.xlsx
 """
 
 import copy
-import re
+import sys
 from pathlib import Path
 
 import openpyxl
-import pypdf
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fee_extraction import load_pt_fees, normalize_code
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "Data"
 
-CDCP_PRICE_FILE = DATA_DIR / "Input_CDCP price files" / "2026 - CDCP PRICE FILE - ON.xlsx"
-PT_FEE_GUIDE_XLSX = DATA_DIR / "Input_PT association fee guides" / "DH" / "ON DH Fee Guide 2026.xlsx"
-PT_FEE_GUIDE_PDF = DATA_DIR / "Input_PT association fee guides" / "DH" / "ON DH Fee Guide 2026.pdf"
+CDCP_DIR = DATA_DIR / "Input_CDCP price files"
+PT_GUIDES_DIR = DATA_DIR / "Input_PT association fee guides"
 TEMPLATE_WORKBOOK = DATA_DIR / "Output_2026 Fee Comparison" / "2026 Fee Comparisons v2.xlsx"
 OUTPUT_WORKBOOK = DATA_DIR / "Output_2026 Fee Comparison" / "2026 Fee Comparisons - generated.xlsx"
 
-PROVINCE = "ON"
 SPECIALTY = "DH"
 
-CLAIM_LINES_PROVINCES = ["AB", "BC", "MB", "NB", "NL", "NS", "ON", "PE", "QC", "SK", "NT", "NU", "YT"]
+# Provinces/territories in the order they'll appear in the output, matching
+# the template's Claim Lines sheet. Not every province has CDCP data for
+# every specialty (e.g. no DH data at all for NT/NU/YT); those are skipped
+# automatically based on what's actually in each CDCP price file.
+ALL_PROVINCES = ["AB", "BC", "MB", "NB", "NL", "NS", "ON", "PE", "QC", "SK", "NT", "NU", "YT"]
 
-_DOLLAR_RE = re.compile(r"[\d,]+\.?\d*")
-
-
-def normalize_code(raw) -> str | None:
-    """Normalize a procedure code (int or str, possibly missing leading zeros) to 5 digits."""
-    if raw is None:
-        return None
-    try:
-        return f"{int(raw):05d}"
-    except (ValueError, TypeError):
-        s = str(raw).strip()
-        return s if s.isdigit() else None
+# A PT fee more than this many times larger/smaller than the matching CDCP
+# fee is flagged for manual review rather than trusted silently -- it's
+# usually a sign the extractor grabbed the wrong number from an ambiguous
+# source layout.
+PLAUSIBILITY_MIN_RATIO = 0.15
+PLAUSIBILITY_MAX_RATIO = 6.0
 
 
-def extract_max_dollar(value) -> float | None:
-    """Extract the largest dollar amount from a fee cell.
+def load_cdcp_fees(province: str, specialty: str) -> dict[str, float] | None:
+    """Read 2026 CDCP provider fees per procedure code for one province/specialty.
 
-    Handles plain numbers, ranges ("$44.66 to $89.32"), and suffixed fees
-    ("$56.02 + exp"). Non-numeric fees (e.g. "c.s." / client specific) return None.
+    Returns None if this province's CDCP price file has no sheet for the
+    given specialty (e.g. no DH data at all for NT/NU/YT).
     """
-    if value is None:
+    path = CDCP_DIR / f"2026 - CDCP PRICE FILE - {province}.xlsx"
+    if not path.exists():
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    matches = _DOLLAR_RE.findall(str(value))
-    numbers = [float(m.replace(",", "")) for m in matches if m and m != "."]
-    return max(numbers) if numbers else None
-
-
-def load_cdcp_fees(path: Path, province: str, specialty: str) -> dict[str, float]:
-    """Read 2026 CDCP provider fees per procedure code from a CDCP price file."""
     wb = openpyxl.load_workbook(path, data_only=True)
+    if specialty not in wb.sheetnames:
+        return None
     ws = wb[specialty]
     header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
     idx = {name: i for i, name in enumerate(header)}
@@ -93,84 +89,12 @@ def load_cdcp_fees(path: Path, province: str, specialty: str) -> dict[str, float
     return fees
 
 
-def load_pt_fees_xlsx(path: Path, sheet_name: str = "Table 1") -> dict[str, float]:
-    """Read 2026 PT association suggested fees per procedure code from the fee guide xlsx."""
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb[sheet_name]
-
-    fees: dict[str, float] = {}
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if len(row) < 3:
-            continue
-        code = normalize_code(row[1])
-        if code is None:
-            continue
-        fee = extract_max_dollar(row[2])
-        if fee is not None:
-            fees[code] = fee
-    return fees
-
-
-_PDF_FEE_RE = re.compile(
-    r"\b(\d{5})\b\s+"
-    r"(\$[\d,]+\.\d{2}(?:\s*(?:to|-)\s*\$?[\d,]+\.\d{2})?(?:\s*\+\s*[A-Za-z]+)*"
-    r"|c\.?\s*s\.?\s*\(?client specific\)?\.?"
-    r"|c\.?\s*s\.?)",
-    re.IGNORECASE,
-)
-
-
-def load_pt_fees_pdf(path: Path) -> dict[str, float]:
-    """Best-effort extraction of procedure code -> fee pairs from the PDF fee guide.
-
-    Used only as a cross-check against the xlsx fee guide, since PDF text
-    extraction can split a code and its fee across lines when the source
-    table wraps a row (this happens for a handful of codes in practice).
-    """
-    reader = pypdf.PdfReader(str(path))
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-
-    fees: dict[str, float] = {}
-    for match in _PDF_FEE_RE.finditer(text):
-        code = match.group(1)
-        fee = extract_max_dollar(match.group(2))
-        if fee is not None:
-            fees[code] = fee
-    return fees
-
-
-def cross_check_pt_fees(primary: dict[str, float], secondary: dict[str, float], codes_of_interest) -> None:
-    """Log any disagreements between the xlsx and PDF fee guide for the codes we actually use."""
-    mismatches = []
-    missing_from_pdf = []
-    for code in codes_of_interest:
-        xlsx_fee = primary.get(code)
-        pdf_fee = secondary.get(code)
-        if xlsx_fee is None:
-            continue
-        if pdf_fee is None:
-            missing_from_pdf.append(code)
-        elif abs(xlsx_fee - pdf_fee) > 0.005:
-            mismatches.append((code, xlsx_fee, pdf_fee))
-
-    if mismatches:
-        print(f"  WARNING: {len(mismatches)} code(s) differ between xlsx and PDF fee guides:")
-        for code, xf, pf in mismatches:
-            print(f"    {code}: xlsx=${xf:.2f} pdf=${pf:.2f}")
-    if missing_from_pdf:
-        print(f"  Note: {len(missing_from_pdf)} code(s) not confidently extracted from PDF "
-              f"(likely a wrapped table row in the source PDF): {', '.join(missing_from_pdf)}")
-    if not mismatches and not missing_from_pdf:
-        print("  PDF cross-check: all codes agree with the xlsx fee guide.")
-
-
 def _dh_header_row(template_ws) -> list[str]:
     return [c.value for c in next(template_ws.iter_rows(min_row=1, max_row=1))]
 
 
-def build_dh_sheet(wb_new: openpyxl.Workbook, template_ws, codes: list[str],
-                    cdcp_fees: dict[str, float], pt_fees: dict[str, float],
-                    province: str, specialty: str) -> None:
+def build_dh_sheet(wb_new: openpyxl.Workbook, template_ws, rows: list[tuple[str, str, dict, dict]]):
+    """rows: list of (province, specialty, cdcp_fees, pt_fees) processed in order."""
     ws = wb_new.create_sheet("DH")
 
     headers = _dh_header_row(template_ws)
@@ -185,47 +109,48 @@ def build_dh_sheet(wb_new: openpyxl.Workbook, template_ws, codes: list[str],
     style_row = 2  # representative data row in the template used for styling
     style_cells = {col: template_ws.cell(style_row, col) for col in range(1, len(headers) + 1)}
 
-    for r, code in enumerate(codes, start=2):
-        cdcp_2026 = cdcp_fees.get(code)
-        pt_2026 = pt_fees.get(code)
+    r = 2
+    for province, specialty, cdcp_fees, pt_fees in rows:
+        for code in sorted(cdcp_fees.keys()):
+            cdcp_2026 = cdcp_fees.get(code)
+            pt_2026 = pt_fees.get(code)
 
-        values = {
-            "A": code,
-            "B": specialty,
-            "C": province,
-            "D": f"=A{r}&C{r}&B{r}",
-            "E": "N/A",  # 2025 CDCP fee: not available in current input files
-            "F": cdcp_2026 if cdcp_2026 is not None else "N/A",
-            "G": "N/A",  # 2025 PT fee: not available in current input files
-            "H": pt_2026 if pt_2026 is not None else "N/A",
-            "I": f'=IFERROR((F{r}-E{r})/E{r},"N/A")',
-            "J": f'=IFERROR((H{r}-G{r})/G{r},"N/A")',
-            "K": f'=IFERROR(F{r}/H{r},"N/A")',
-            "L": 0,  # CDCP claim weight: claim-count data not available yet
-            "M": f'=IF(H{r}="N/A",0,L{r})',
-            "N": f"=IFERROR(M{r}/VLOOKUP(C{r},'Claim Lines'!A$26:F$38,6,FALSE),\"\")",
-            "O": 0,  # Claim count nat'l: claim-count data not available yet
-            "P": 0,  # PT weight: derived from claim counts, not available yet
-            "Q": f"=IFERROR(P{r}*I{r},0)",
-            "R": f"=O{r}/'Claim Lines'!F$25",
-            "S": f"=IFERROR(R{r}*I{r},0)",
-            "T": f'=IFERROR(K{r}*R{r},"N/A")',
-            "U": f'=IFERROR(J{r}*R{r},"N/A")',
-            "V": f'=IFERROR(J{r}*P{r},"N/A")',
-            "W": f"=L{r}/'Claim Lines'!H$3",
-            "X": f"=IFERROR(W{r}*I{r},0)",
-            "Y": f'=IFERROR(N{r}*K{r},"")',
-        }
+            values = {
+                "A": code,
+                "B": specialty,
+                "C": province,
+                "D": f"=A{r}&C{r}&B{r}",
+                "E": "N/A",  # 2025 CDCP fee: not available in current input files
+                "F": cdcp_2026 if cdcp_2026 is not None else "N/A",
+                "G": "N/A",  # 2025 PT fee: not available in current input files
+                "H": pt_2026 if pt_2026 is not None else "N/A",
+                "I": f'=IFERROR((F{r}-E{r})/E{r},"N/A")',
+                "J": f'=IFERROR((H{r}-G{r})/G{r},"N/A")',
+                "K": f'=IFERROR(F{r}/H{r},"N/A")',
+                "L": 0,  # CDCP claim weight: claim-count data not available yet
+                "M": f'=IF(H{r}="N/A",0,L{r})',
+                "N": f"=IFERROR(M{r}/VLOOKUP(C{r},'Claim Lines'!A$26:F$38,6,FALSE),\"\")",
+                "O": 0,  # Claim count nat'l: claim-count data not available yet
+                "P": 0,  # PT weight: derived from claim counts, not available yet
+                "Q": f"=IFERROR(P{r}*I{r},0)",
+                "R": f"=O{r}/'Claim Lines'!F$25",
+                "S": f"=IFERROR(R{r}*I{r},0)",
+                "T": f'=IFERROR(K{r}*R{r},"N/A")',
+                "U": f'=IFERROR(J{r}*R{r},"N/A")',
+                "V": f'=IFERROR(J{r}*P{r},"N/A")',
+                "W": f"=L{r}/'Claim Lines'!H$3",
+                "X": f"=IFERROR(W{r}*I{r},0)",
+                "Y": f'=IFERROR(N{r}*K{r},"")',
+            }
 
-        for col_idx, col_letter in enumerate(
-            "ABCDEFGHIJKLMNOPQRSTUVWXY", start=1
-        ):
-            cell = ws.cell(r, col_idx, values[col_letter])
-            style_src = style_cells[col_idx]
-            cell.font = copy.copy(style_src.font)
-            cell.fill = copy.copy(style_src.fill)
-            cell.alignment = copy.copy(style_src.alignment)
-            cell.number_format = style_src.number_format
+            for col_idx, col_letter in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXY", start=1):
+                cell = ws.cell(r, col_idx, values[col_letter])
+                style_src = style_cells[col_idx]
+                cell.font = copy.copy(style_src.font)
+                cell.fill = copy.copy(style_src.fill)
+                cell.alignment = copy.copy(style_src.alignment)
+                cell.number_format = style_src.number_format
+            r += 1
 
     for col, dim in template_ws.column_dimensions.items():
         ws.column_dimensions[col].width = dim.width
@@ -249,50 +174,77 @@ def build_claim_lines_sheet(wb_new: openpyxl.Workbook) -> None:
     ws["F3"] = "=SUM(DH!L:L)"
     ws["H3"] = "=SUM(D3:F3)"
 
-    for i, prov in enumerate(CLAIM_LINES_PROVINCES):
-        row = 4 + i
-        ws.cell(row, 1, prov)
+    for i, prov in enumerate(ALL_PROVINCES):
+        ws.cell(4 + i, 1, prov)
 
     ws["A23"] = ("For CDCP/PT Comparison (removing claim lines where the 2026 PT Fee Guide "
                  "or 2026 CDCP benefit grid does not have a fee)")
     ws["A25"] = "Total"
     ws["F25"] = "=SUM(DH!M:M)"
 
-    for i, prov in enumerate(CLAIM_LINES_PROVINCES):
+    for i, prov in enumerate(ALL_PROVINCES):
         row = 26 + i
         ws.cell(row, 1, prov)
         ws.cell(row, 6, f'=SUMIF(DH!C:C,"{prov}",DH!M:M)')
 
 
+def report_plausibility(cdcp_fees: dict[str, float], pt_fees: dict[str, float]) -> None:
+    suspects = []
+    for code, pt_fee in pt_fees.items():
+        cdcp_fee = cdcp_fees.get(code)
+        if not cdcp_fee:
+            continue
+        ratio = pt_fee / cdcp_fee
+        if ratio < PLAUSIBILITY_MIN_RATIO or ratio > PLAUSIBILITY_MAX_RATIO:
+            suspects.append((code, pt_fee, cdcp_fee, ratio))
+    if suspects:
+        print(f"    REVIEW: {len(suspects)} code(s) with an implausible PT/CDCP fee ratio "
+              f"(possible extraction error, verify manually):")
+        for code, pt_fee, cdcp_fee, ratio in suspects:
+            print(f"      {code}: PT=${pt_fee:.2f} CDCP=${cdcp_fee:.2f} (ratio {ratio:.2f}x)")
+
+
 def main() -> None:
-    print(f"Loading CDCP {SPECIALTY} fees for {PROVINCE} from {CDCP_PRICE_FILE.name}")
-    cdcp_fees = load_cdcp_fees(CDCP_PRICE_FILE, PROVINCE, SPECIALTY)
-    print(f"  {len(cdcp_fees)} procedure codes with a 2026 CDCP fee.")
-
-    print(f"Loading PT {SPECIALTY} fees for {PROVINCE} from {PT_FEE_GUIDE_XLSX.name}")
-    pt_fees_xlsx = load_pt_fees_xlsx(PT_FEE_GUIDE_XLSX)
-    print(f"  {len(pt_fees_xlsx)} procedure codes with a 2026 PT fee.")
-
-    print(f"Cross-checking against {PT_FEE_GUIDE_PDF.name}")
-    pt_fees_pdf = load_pt_fees_pdf(PT_FEE_GUIDE_PDF)
-    cross_check_pt_fees(pt_fees_xlsx, pt_fees_pdf, cdcp_fees.keys())
-
-    codes = sorted(cdcp_fees.keys())
-    matched = sum(1 for c in codes if c in pt_fees_xlsx)
-    print(f"Matched PT fee for {matched}/{len(codes)} CDCP procedure codes "
-          f"({len(codes) - matched} will show 'N/A' PT fee).")
+    specialty_dir = PT_GUIDES_DIR / SPECIALTY
 
     template_wb = openpyxl.load_workbook(TEMPLATE_WORKBOOK, data_only=False)
     template_ws = template_wb["DH"]
 
     wb_new = openpyxl.Workbook()
     wb_new.remove(wb_new.active)
-
     build_claim_lines_sheet(wb_new)
-    build_dh_sheet(wb_new, template_ws, codes, cdcp_fees, pt_fees_xlsx, PROVINCE, SPECIALTY)
+
+    rows = []
+    total_codes = 0
+    total_matched = 0
+    for province in ALL_PROVINCES:
+        cdcp_fees = load_cdcp_fees(province, SPECIALTY)
+        if cdcp_fees is None or not cdcp_fees:
+            print(f"{province}: no CDCP {SPECIALTY} data, skipped.")
+            continue
+
+        pt_fees, sources_used, files_found = load_pt_fees(
+            specialty_dir, province, set(cdcp_fees.keys()), verbose=False
+        )
+        matched = len(pt_fees)
+        total_codes += len(cdcp_fees)
+        total_matched += matched
+
+        source_desc = ", ".join(f"{name} ({n})" for name, n in sources_used) or "no PT fee guide found"
+        print(f"{province}: {len(cdcp_fees)} CDCP codes, {matched} PT fees matched -- {source_desc}")
+        if not files_found:
+            print(f"    Note: no PT fee guide file found for {province}/{SPECIALTY}; PT fees will be 'N/A'.")
+
+        report_plausibility(cdcp_fees, pt_fees)
+        rows.append((province, SPECIALTY, cdcp_fees, pt_fees))
+
+    build_dh_sheet(wb_new, template_ws, rows)
 
     wb_new.save(OUTPUT_WORKBOOK)
-    print(f"\nWrote {len(codes)} rows to {OUTPUT_WORKBOOK}")
+    total_rows = sum(len(cdcp_fees) for _, _, cdcp_fees, _ in rows)
+    print(f"\nWrote {total_rows} rows across {len(rows)} provinces to {OUTPUT_WORKBOOK}")
+    print(f"Overall PT fee match rate: {total_matched}/{total_codes} "
+          f"({100 * total_matched / total_codes:.1f}%)")
 
 
 if __name__ == "__main__":
