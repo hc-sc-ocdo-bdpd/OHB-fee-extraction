@@ -6,7 +6,19 @@ Sheets compared: GP, QC GP, SP, QC SP, DD, DH.
 Rows are matched between the two files using (PT, Specialty, Procedure Code).
 
 Blank/empty cells are treated as equivalent to the text 'N/A'. Numeric fees
-are compared to the nearest cent to absorb float rounding noise.
+are compared to the nearest cent to absorb float rounding noise, and a
+'$'-formatted string value (e.g. "$89.80") is treated the same as the plain
+number 89.8 -- a leading "$" (and thousands commas) don't create a mismatch.
+
+Match rules:
+  - If the ground truth has no real value (blank/N/A/0/0.0) for a field,
+    the row is always counted as a match regardless of what the generated
+    file has there -- there's nothing meaningful to disagree with.
+  - 0/0.0 is treated as equivalent to 'N/A' on the ground-truth side for the
+    rule above (a ground truth of 0 also counts as "no real value").
+  - Rows present in the generated file but absent from the ground truth
+    (extra keys) are counted and shown alongside the 'Missing' column, but
+    never factored into the Total/Matched/Match % figures.
 
 The 'DD' sheet has three sub-columns per fee ('Prof Fee', 'Internal Lab Fee',
 'Combo Fee') under each of '2026 CDCP Fee' and '2026 PT Fee', and uses two
@@ -58,10 +70,31 @@ def normalize_fee(value):
         stripped = value.strip()
         if stripped == "" or stripped.upper() == "N/A":
             return "N/A"
-        return stripped
+        # A currency-formatted value ("$89.80", "$1,234.56") is the same fee
+        # as the plain number -- strip "$" and thousands commas and try to
+        # read it as a number before giving up and treating it as text.
+        cleaned = stripped.replace("$", "").replace(",", "").strip()
+        try:
+            return round(float(cleaned), 2)
+        except ValueError:
+            return stripped
     if isinstance(value, (int, float)):
         return round(float(value), 2)
     return value
+
+
+def is_blank_equivalent(value):
+    """True for a ground-truth value that means 'no real fee' -- blank/N/A
+    or a literal 0/0.0, both of which are treated the same way."""
+    return value == "N/A" or (isinstance(value, (int, float)) and float(value) == 0.0)
+
+
+def values_match(gt_value, gen_value):
+    if gt_value == gen_value:
+        return True
+    # No real ground-truth value to disagree with -> always a match,
+    # whatever the generated file has there.
+    return is_blank_equivalent(gt_value)
 
 
 def find_header_columns(sheet, header_row, target_names):
@@ -120,6 +153,7 @@ def build_sheet_index(sheet, sheet_name):
 def compare_sheet(gt_sheet, gen_sheet, sheet_name):
     gt_rows, fields = build_sheet_index(gt_sheet, sheet_name)
     gen_rows, _ = build_sheet_index(gen_sheet, sheet_name)
+    extra_count = len(set(gen_rows) - set(gt_rows))
 
     results = []
     for field in fields:
@@ -131,7 +165,7 @@ def compare_sheet(gt_sheet, gen_sheet, sheet_name):
                 missing += 1
                 continue
             gen_value = normalize_fee(gen_rows[key][field])
-            if gt_value == gen_value:
+            if values_match(gt_value, gen_value):
                 matched += 1
             else:
                 mismatched += 1
@@ -146,12 +180,18 @@ def compare_sheet(gt_sheet, gen_sheet, sheet_name):
             "matched": matched,
             "mismatched": mismatched,
             "missing": missing,
+            "extra": extra_count,
             "match_rate": match_rate,
             "examples": mismatch_examples,
         })
 
-    extra_keys = set(gen_rows) - set(gt_rows)
-    return results, len(extra_keys)
+    return results, extra_count
+
+
+def format_missing(missing, extra):
+    if extra:
+        return f"{missing} (+{extra} extra)"
+    return str(missing)
 
 
 def main():
@@ -159,7 +199,7 @@ def main():
     gen_wb = openpyxl.load_workbook(GEN_FILE, data_only=True)
 
     all_results = []
-    header = f"{'Sheet':<8} {'Field':<28} {'Total':>7} {'Matched':>8} {'Mismatch':>9} {'Missing':>8} {'Match %':>8}"
+    header = f"{'Sheet':<8} {'Field':<28} {'Total':>7} {'Matched':>8} {'Mismatch':>9} {'Missing':>16} {'Match %':>8}"
     print(header)
     print("-" * len(header))
 
@@ -170,17 +210,16 @@ def main():
         results, extra_count = compare_sheet(gt_wb[sheet_name], gen_wb[sheet_name], sheet_name)
         all_results.extend(results)
         for r in results:
+            missing_display = format_missing(r["missing"], r["extra"])
             print(f"{r['sheet']:<8} {r['field']:<28} {r['total']:>7} {r['matched']:>8} "
-                  f"{r['mismatched']:>9} {r['missing']:>8} {r['match_rate']:>7.2f}%")
-        if extra_count:
-            print(f"{sheet_name}: {extra_count} row(s) in generated file not present in ground truth")
+                  f"{r['mismatched']:>9} {missing_display:>16} {r['match_rate']:>7.2f}%")
 
     print("-" * len(header))
     total_all = sum(r["total"] for r in all_results)
     matched_all = sum(r["matched"] for r in all_results)
     overall_rate = (matched_all / total_all * 100) if total_all else float("nan")
     print(f"{'OVERALL':<8} {'':<28} {total_all:>7} {matched_all:>8} "
-          f"{total_all - matched_all:>9} {'':>8} {overall_rate:>7.2f}%")
+          f"{total_all - matched_all:>9} {'':>16} {overall_rate:>7.2f}%")
 
     print("\nSample mismatches (up to 5 per field):")
     for r in all_results:
