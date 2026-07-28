@@ -31,14 +31,20 @@ being labelled 'PT', column C holds the PT despite being labelled
 trusted from the header text.
 
 Set GT_FILE and GEN_FILE below to the two workbook paths before running.
+Also writes a full mismatch/missing/extra report to an .xlsx file next to
+GT_FILE, in the same 'Output_2026 Fee Comparison' folder (see OUTPUT_FILE).
 """
 
 from pathlib import Path
 
 import openpyxl
+from openpyxl.styles import Font
 
 GT_FILE = Path(r"C:\Users\JOGILL\OneDrive - HC-SC PHAC-ASPC\Desktop\OHB\Data\Output_2026 Fee Comparison\2026 Fee Comparisons v2_updated.xlsx")
 GEN_FILE = Path(r"C:\Users\JOGILL\OneDrive - HC-SC PHAC-ASPC\Desktop\OHB\Data\Output_2026 Fee Comparison\2026 Fee Comparisons - generated.xlsx")
+
+# Written into the same "Output_2026 Fee Comparison" folder as GT_FILE.
+OUTPUT_FILE = GT_FILE.parent / "Fee_Comparison_Mismatches.xlsx"
 
 SHEETS = ["GP", "QC GP", "SP", "QC SP", "DD", "DH"]
 
@@ -153,24 +159,28 @@ def build_sheet_index(sheet, sheet_name):
 def compare_sheet(gt_sheet, gen_sheet, sheet_name):
     gt_rows, fields = build_sheet_index(gt_sheet, sheet_name)
     gen_rows, _ = build_sheet_index(gen_sheet, sheet_name)
-    extra_count = len(set(gen_rows) - set(gt_rows))
+    extra_keys = sorted(set(gen_rows) - set(gt_rows))
 
     results = []
+    all_mismatches = []
+    all_missing = []
     for field in fields:
         matched = mismatched = missing = 0
-        mismatch_examples = []
         for key, gt_field_values in gt_rows.items():
             gt_value = normalize_fee(gt_field_values[field])
             if key not in gen_rows:
                 missing += 1
+                all_missing.append({"field": field, "key": key, "ground_truth": gt_value})
                 continue
             gen_value = normalize_fee(gen_rows[key][field])
             if values_match(gt_value, gen_value):
                 matched += 1
             else:
                 mismatched += 1
-                if len(mismatch_examples) < 5:
-                    mismatch_examples.append((key, gt_value, gen_value))
+                all_mismatches.append({
+                    "field": field, "key": key,
+                    "ground_truth": gt_value, "generated": gen_value,
+                })
         total = len(gt_rows)
         match_rate = (matched / total * 100) if total else float("nan")
         results.append({
@@ -180,12 +190,11 @@ def compare_sheet(gt_sheet, gen_sheet, sheet_name):
             "matched": matched,
             "mismatched": mismatched,
             "missing": missing,
-            "extra": extra_count,
+            "extra": len(extra_keys),
             "match_rate": match_rate,
-            "examples": mismatch_examples,
         })
 
-    return results, extra_count
+    return results, extra_keys, all_mismatches, all_missing
 
 
 def format_missing(missing, extra):
@@ -194,11 +203,78 @@ def format_missing(missing, extra):
     return str(missing)
 
 
+def write_report(all_results, mismatches_by_sheet, missing_by_sheet, extra_by_sheet, output_path):
+    wb = openpyxl.Workbook()
+    bold = Font(bold=True)
+
+    summary_ws = wb.active
+    summary_ws.title = "Summary"
+    headers = ["Sheet", "Field", "Total", "Matched", "Mismatched", "Missing", "Extra", "Match %"]
+    summary_ws.append(headers)
+    for cell in summary_ws[1]:
+        cell.font = bold
+    for r in all_results:
+        summary_ws.append([
+            r["sheet"], r["field"], r["total"], r["matched"],
+            r["mismatched"], r["missing"], r["extra"], round(r["match_rate"], 2),
+        ])
+    total_all = sum(r["total"] for r in all_results)
+    matched_all = sum(r["matched"] for r in all_results)
+    overall_rate = round(matched_all / total_all * 100, 2) if total_all else None
+    summary_ws.append([])
+    summary_ws.append(["OVERALL", "", total_all, matched_all, total_all - matched_all, "", "", overall_rate])
+    for cell in summary_ws[summary_ws.max_row]:
+        cell.font = bold
+    for col, width in zip("ABCDEFGH", [10, 28, 8, 9, 11, 16, 8, 9]):
+        summary_ws.column_dimensions[col].width = width
+
+    mismatches_ws = wb.create_sheet("Mismatches")
+    mismatches_ws.append(["Sheet", "Field", "PT", "Specialty", "Procedure Code", "Ground Truth", "Generated"])
+    for cell in mismatches_ws[1]:
+        cell.font = bold
+    for sheet_name, rows in mismatches_by_sheet.items():
+        for row in rows:
+            pt, specialty, code = row["key"]
+            mismatches_ws.append([
+                sheet_name, row["field"], pt, specialty, code,
+                row["ground_truth"], row["generated"],
+            ])
+    for col, width in zip("ABCDEFG", [10, 28, 8, 10, 14, 14, 14]):
+        mismatches_ws.column_dimensions[col].width = width
+
+    missing_ws = wb.create_sheet("Missing")
+    missing_ws.append(["Sheet", "Field", "PT", "Specialty", "Procedure Code", "Ground Truth"])
+    for cell in missing_ws[1]:
+        cell.font = bold
+    for sheet_name, rows in missing_by_sheet.items():
+        for row in rows:
+            pt, specialty, code = row["key"]
+            missing_ws.append([sheet_name, row["field"], pt, specialty, code, row["ground_truth"]])
+    for col, width in zip("ABCDEF", [10, 28, 8, 10, 14, 14]):
+        missing_ws.column_dimensions[col].width = width
+
+    extra_ws = wb.create_sheet("Extra in Generated")
+    extra_ws.append(["Sheet", "PT", "Specialty", "Procedure Code"])
+    for cell in extra_ws[1]:
+        cell.font = bold
+    for sheet_name, keys in extra_by_sheet.items():
+        for pt, specialty, code in keys:
+            extra_ws.append([sheet_name, pt, specialty, code])
+    for col, width in zip("ABCD", [10, 8, 10, 14]):
+        extra_ws.column_dimensions[col].width = width
+
+    wb.save(output_path)
+
+
 def main():
     gt_wb = openpyxl.load_workbook(GT_FILE, data_only=True)
     gen_wb = openpyxl.load_workbook(GEN_FILE, data_only=True)
 
     all_results = []
+    mismatches_by_sheet = {}
+    missing_by_sheet = {}
+    extra_by_sheet = {}
+
     header = f"{'Sheet':<8} {'Field':<28} {'Total':>7} {'Matched':>8} {'Mismatch':>9} {'Missing':>16} {'Match %':>8}"
     print(header)
     print("-" * len(header))
@@ -207,8 +283,13 @@ def main():
         if sheet_name not in gt_wb.sheetnames or sheet_name not in gen_wb.sheetnames:
             print(f"{sheet_name}: missing from one of the workbooks, skipped")
             continue
-        results, extra_count = compare_sheet(gt_wb[sheet_name], gen_wb[sheet_name], sheet_name)
+        results, extra_keys, mismatches, missing = compare_sheet(
+            gt_wb[sheet_name], gen_wb[sheet_name], sheet_name
+        )
         all_results.extend(results)
+        mismatches_by_sheet[sheet_name] = mismatches
+        missing_by_sheet[sheet_name] = missing
+        extra_by_sheet[sheet_name] = extra_keys
         for r in results:
             missing_display = format_missing(r["missing"], r["extra"])
             print(f"{r['sheet']:<8} {r['field']:<28} {r['total']:>7} {r['matched']:>8} "
@@ -221,12 +302,8 @@ def main():
     print(f"{'OVERALL':<8} {'':<28} {total_all:>7} {matched_all:>8} "
           f"{total_all - matched_all:>9} {'':>16} {overall_rate:>7.2f}%")
 
-    print("\nSample mismatches (up to 5 per field):")
-    for r in all_results:
-        if r["examples"]:
-            print(f"\n{r['sheet']} / {r['field']}:")
-            for key, gt_value, gen_value in r["examples"]:
-                print(f"  {key}: ground truth={gt_value!r}  generated={gen_value!r}")
+    write_report(all_results, mismatches_by_sheet, missing_by_sheet, extra_by_sheet, OUTPUT_FILE)
+    print(f"\nFull mismatch/missing/extra report written to: {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
