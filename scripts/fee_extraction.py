@@ -33,7 +33,14 @@ _DOLLAR_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 # quantity) rather than reading the number as 1509.
 _FRENCH_GROUPED_SPACE_RE = re.compile(r"\d{1,3}(?:[\s ]\d{3})+(?:[.,]\d{2})?\s*\$")
 
-_NO_FEE_MARKER_RE = re.compile(r"^\s*(?:I\.?\s*C\.?|c\.?\s*s\.?)\s*\.?\s*$", re.IGNORECASE)
+# "S.C." ("Service Charge"/"Independent Charge", per NB's DD guide's own
+# abbreviations legend) is yet another no-fixed-fee marker, like "I.C." and
+# "c.s." -- but with the two letters in the opposite order, so it does NOT
+# match the "c.s." alternative above despite meaning the same thing. Without
+# its own alternative here, a cell/segment whose only content is "S.C."
+# isn't recognized as a marker at all, so has_no_fee_marker (below, and in
+# _FEE_TOKEN_TIERS) never fires for it and it just resolves to nothing.
+_NO_FEE_MARKER_RE = re.compile(r"^\s*(?:I\.?\s*C\.?|c\.?\s*s\.?|s\.?\s*c\.?)\s*\.?\s*$", re.IGNORECASE)
 
 SPREADSHEET_SUFFIXES = {".xlsx", ".xlsm", ".xls"}
 CSV_SUFFIXES = {".csv"}
@@ -541,6 +548,14 @@ _FEE_TOKEN_TIERS = [
     # bare-whole-number fallback below, which then misreads the "2" from
     # the size range ("1 - 2 cm") in the description as if it were a fee.
     (re.compile(r"\bI\.?\s*C\.?\b", re.IGNORECASE), extract_max_dollar),
+    # "S.C." ("Service Charge"/"Independent Charge", per NB's DD guide) --
+    # the same "no fixed fee" idea as "c.s." above, but with the two letters
+    # reversed, so the "c.s." tier never matches it. Seen 136 times in NB's
+    # DD guide alone; without this tier, every one of those rows' segments
+    # (no digits at all -- just the word "S.C." itself) fails to match
+    # anything all the way down to the bare-number tier too, so the code
+    # never resolves at all, rather than correctly resolving to "no fee".
+    (re.compile(r"\bS\.?\s*C\.?\b", re.IGNORECASE), extract_max_dollar),
 ]
 _BARE_NUMBER_TIER = (re.compile(r"\b\d{1,4}\b"), extract_max_dollar)
 
@@ -702,8 +717,27 @@ def extract_codes_from_text(text: str, known_codes: set[str]) -> dict[str, float
 
 def load_fees_from_pdf(path: Path, known_codes: set[str]) -> dict[str, float]:
     reader = pypdf.PdfReader(str(path))
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    return extract_codes_from_text(text, known_codes)
+    plain_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    plain_fees = extract_codes_from_text(plain_text, known_codes)
+    if len(plain_fees) >= len(known_codes):
+        return plain_fees
+    # Some guides' fee tables are laid out in columns that pypdf's default
+    # (draw-order) extraction serializes column-major -- every description,
+    # then every code, then every fee, each in its own block far from the
+    # others -- which breaks the code-adjacent-to-its-own-fee assumption
+    # extract_codes_from_text relies on entirely (seen in NB's DD guide: only
+    # 24/398 codes resolved this way, most to the wrong fee). "layout" mode
+    # instead reconstructs each row using the text's actual on-page position,
+    # so a row's code and fee end up next to each other again (331/398 for
+    # the same file). Only tried as a fallback, and only kept if it actually
+    # resolves more codes than the plain pass did -- for a source where plain
+    # mode already works (the common case), layout's heavier padding and
+    # different line-wrapping isn't worth risking a regression on.
+    layout_text = "\n".join(
+        page.extract_text(extraction_mode="layout") or "" for page in reader.pages
+    )
+    layout_fees = extract_codes_from_text(layout_text, known_codes)
+    return layout_fees if len(layout_fees) > len(plain_fees) else plain_fees
 
 
 def load_fees_from_docx(path: Path, known_codes: set[str], target_specialty: str | None = None) -> dict[str, float]:
@@ -864,6 +898,34 @@ def load_pt_fees_from_files(
             except Exception as e:
                 if verbose:
                     print(f"    WARNING: failed to read {f.name}: {e}")
+
+    # Last resort, only for whatever spreadsheet/csv/docx/pdf-text all
+    # failed to resolve: some PDFs (e.g. NL's DD guide) have no extractable
+    # text at all -- their text was flattened to vector curves on export --
+    # so nothing above can ever find anything in them no matter how the
+    # content stream is read. OCR-ing the rendered page image is the only
+    # way to recover data from a file like that. Deliberately tried last and
+    # only for the remaining gap (never re-tried on a pdf that already
+    # resolved fine above) since it's slow and occasionally misreads a
+    # digit, and only imported here so a machine without the OCR
+    # dependencies installed (see ocr_pdf_fees.py) just skips this tier
+    # instead of failing the whole extraction run.
+    if pdfs and (known_codes - fees.keys()):
+        try:
+            from ocr_pdf_fees import load_fees_from_pdf_via_ocr
+        except ImportError as e:
+            if verbose:
+                print(f"    WARNING: OCR fallback unavailable ({e}); skipping")
+        else:
+            for f in pdfs:
+                remaining = known_codes - fees.keys()
+                if not remaining:
+                    break
+                try:
+                    _apply(f"{f.name} (OCR)", load_fees_from_pdf_via_ocr(f, remaining))
+                except Exception as e:
+                    if verbose:
+                        print(f"    WARNING: OCR failed for {f.name}: {e}")
 
     return fees, sources_used
 
@@ -1075,6 +1137,64 @@ def extract_dd_codes_from_rows(tables, known_codes: set[str]) -> dict[str, dict[
     return results
 
 
+_DD_PDF_LINE_CODE_RE = re.compile(r"\b(\d{5})\b")
+_DD_PDF_NUMBER_RE = re.compile(r"\d[\d,]*\.\d{2}")
+
+
+def extract_dd_codes_from_pdf_text(text: str, known_codes: set[str]) -> dict[str, dict[str, float]]:
+    """DD-specific PDF scanner for guides (so far only NB's) that print a
+    code's Prof/Lab/Total fees together on the same line, in that left-to-
+    right order -- e.g. "Diagnostic Model - Maxillary   10120   122.00
+    184.00   306.00" (confirmed left-to-right by Total == Prof + Lab in
+    every such line). `text` should be pdf "layout" extraction-mode text
+    (see load_fees_from_pdf) -- plain-mode text serializes multi-column
+    tables in draw order, scattering a row's numbers away from its code
+    entirely, so there'd be nothing to find on the code's own line at all.
+
+    The generic single-fee PDF scanner (load_fees_from_pdf) can only ever
+    take one number per code (the rightmost, i.e. Total), silently losing
+    the Prof/Lab breakdown for any such row. This recovers it directly from
+    the numbers on the same line as the code, without needing a
+    recognizable column header -- NB's own header ("CODE / CLINICAL FEE /
+    TOTAL FEE") doesn't even name a "Lab" column at all; the breakdown only
+    shows up as a third number on the rows that have one.
+
+    A line with exactly one number after the code is Total only (Prof/Lab
+    genuinely undifferentiated, same as the generic scanner). Exactly two
+    IDENTICAL numbers is common for procedures with no lab component at all
+    (Clinical Fee == Total Fee); recorded as Total with Lab forced to 0.0,
+    not left unknown, matching this project's established "a genuinely
+    blank side is 0, not unknown" DD convention (see
+    extract_dd_codes_from_rows). Three or more numbers is read as (prof,
+    lab, total) -- but only kept as such if it actually satisfies prof +
+    lab == total (within a cent); otherwise treated as Total-only, so a
+    line with other, unrelated numbers on it isn't misread as a real
+    Prof/Lab/Total triple.
+    """
+    results: dict[str, dict[str, float]] = {}
+    for line in text.split("\n"):
+        code_match = _DD_PDF_LINE_CODE_RE.search(line)
+        if not code_match:
+            continue
+        code = code_match.group(1)
+        if code not in known_codes or code in results:
+            continue
+        numbers = [float(n.replace(",", "")) for n in _DD_PDF_NUMBER_RE.findall(line[code_match.end():])]
+        if not numbers:
+            continue
+        if len(numbers) == 2 and numbers[0] == numbers[1]:
+            results[code] = {"prof": numbers[0], "lab": 0.0, "total": numbers[0]}
+        elif len(numbers) >= 3:
+            prof, lab, total = numbers[0], numbers[1], numbers[-1]
+            if abs((prof + lab) - total) < 0.01:
+                results[code] = {"prof": prof, "lab": lab, "total": total}
+            else:
+                results[code] = {"total": numbers[-1]}
+        else:
+            results[code] = {"total": numbers[-1]}
+    return results
+
+
 def load_pt_dd_fees_from_files(files: list[Path], known_codes: set[str], verbose: bool = True):
     """DD-specific: resolves separate Prof/Lab/Total fees per code (see
     extract_dd_codes_from_rows) from spreadsheet sources whose columns are
@@ -1130,6 +1250,28 @@ def load_pt_dd_fees_from_files(files: list[Path], known_codes: set[str], verbose
         if new_fees:
             role_fees.update(new_fees)
             sources_used.append((f.name, len(new_fees)))
+
+    # PDFs whose rows carry Prof/Lab/Total on the same line as the code
+    # (see extract_dd_codes_from_pdf_text) -- tried before the generic
+    # single-fee fallback below so a PDF source doesn't lose its Prof/Lab
+    # breakdown down to Total-only just because it isn't a spreadsheet/docx.
+    for f in (f for f in files if f.suffix.lower() in PDF_SUFFIXES):
+        remaining = known_codes - role_fees.keys()
+        if not remaining:
+            break
+        try:
+            reader = pypdf.PdfReader(str(f))
+            layout_text = "\n".join(
+                page.extract_text(extraction_mode="layout") or "" for page in reader.pages
+            )
+            new_fees = extract_dd_codes_from_pdf_text(layout_text, remaining)
+        except Exception as e:
+            if verbose:
+                print(f"    WARNING: failed to read {f.name}: {e}")
+            continue
+        if new_fees:
+            role_fees.update(new_fees)
+            sources_used.append((f"{f.name} (pdf rows)", len(new_fees)))
 
     missing = known_codes - role_fees.keys()
     if missing:

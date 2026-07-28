@@ -1,0 +1,18 @@
+# Python dependencies for scripts/ (fee_extraction.py, cdcp_loader.py,
+# sheet_builders.py, build_fee_comparison.py, ocr_pdf_fees.py).
+#
+# pdf2image and pytesseract also need two system packages pip can't install
+# on its own -- without them, the OCR fallback tier in
+# fee_extraction.load_pt_fees_from_files silently no-ops (see
+# ocr_pdf_fees.py):
+#   - poppler-utils  (provides pdftoppm/pdftocairo, used by pdf2image)
+#   - tesseract-ocr  (the OCR engine itself, used by pytesseract)
+# On Debian/Ubuntu: apt-get install poppler-utils tesseract-ocr
+
+openpyxl>=3.1.5
+pypdf>=6.14.2
+xlrd>=2.0.2
+python-docx>=1.2.0
+pdf2image>=1.17.0
+pytesseract>=0.3.13
+Pillow>=12.3.0
