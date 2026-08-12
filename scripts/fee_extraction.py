@@ -31,7 +31,20 @@ _DOLLAR_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 # otherwise split "1 509" into separate "1" and "509" tokens (fragmenting
 # the thousands digit and, worse, silently discarding it as looking like a
 # quantity) rather than reading the number as 1509.
-_FRENCH_GROUPED_SPACE_RE = re.compile(r"\d{1,3}(?:[\s ]\d{3})+(?:[.,]\d{2})?\s*\$")
+_FRENCH_GROUPED_SPACE_RE = re.compile(r"(?<!\d)\d{1,3}(?:[\s ]\d{3})+(?:[.,]\d{2})?\s*\$")
+
+# Same French-Canadian space-grouped thousands, but without a trailing "$" --
+# seen in QC's GP guide, where a cell just reads "1 261" with no dollar sign
+# at all. Without this, "1 261" falls all the way through to the plain-digit
+# _DOLLAR_RE pass below, which has no notion of a space as a thousands
+# separator and so splits it into two unrelated tokens, "1" and "261" -- and
+# since callers take the *last* candidate as the fee, the leading digit(s)
+# get silently dropped (a real case: code 27200's true fee of 1261 was
+# extracted as 261). Guarded on both sides with a "not adjacent to another
+# digit" check so it can't be carved out of an unrelated longer digit run --
+# e.g. two 5-digit procedure codes separated only by a space ("01120 01130")
+# must NOT be misread as a single grouped number.
+_FRENCH_GROUPED_NO_DOLLAR_RE = re.compile(r"(?<!\d)\d{1,3}(?:[\s ]\d{3})+(?:[.,]\d{2})?(?!\d)")
 
 # "S.C." ("Service Charge"/"Independent Charge", per NB's DD guide's own
 # abbreviations legend) is yet another no-fixed-fee marker, like "I.C." and
@@ -40,7 +53,10 @@ _FRENCH_GROUPED_SPACE_RE = re.compile(r"\d{1,3}(?:[\s ]\d{3})+(?:[.,]\d{2})?\s*
 # its own alternative here, a cell/segment whose only content is "S.C."
 # isn't recognized as a marker at all, so has_no_fee_marker (below, and in
 # _FEE_TOKEN_TIERS) never fires for it and it just resolves to nothing.
-_NO_FEE_MARKER_RE = re.compile(r"^\s*(?:I\.?\s*C\.?|c\.?\s*s\.?|s\.?\s*c\.?)\s*\.?\s*$", re.IGNORECASE)
+_NO_FEE_MARKER_RE = re.compile(
+    r"^\s*(?:I\.?\s*C\.?|c\.?\s*s\.?|s\.?\s*c\.?|(?:actual\s+)?lab(?:\s+fee)?)\s*\.?\s*$",
+    re.IGNORECASE,
+)
 
 SPREADSHEET_SUFFIXES = {".xlsx", ".xlsm", ".xls"}
 CSV_SUFFIXES = {".csv"}
@@ -61,6 +77,15 @@ def normalize_code(raw) -> str | None:
 
     A handful of GP/SP codes are alphanumeric (e.g. "P0500") rather than
     purely numeric -- one letter followed by 3-5 digits is also accepted.
+
+    A leading "*" is stripped before matching -- BC's DH guide flags a code
+    with "*00616" at its real, priced entry (the asterisk is a footnote
+    marker referencing a relocation note elsewhere), then repeats the bare
+    code "00616" again later at a stub cross-reference row ("* moved after
+    00611 for clarity") with no real fee, just placeholder zeros. Without
+    stripping the "*", the starred row's code is never recognized at all, so
+    the scanner falls through to the stub row instead and reports its
+    placeholder 0 as the fee.
     """
     if raw is None:
         return None
@@ -69,12 +94,24 @@ def normalize_code(raw) -> str | None:
     try:
         return f"{int(raw):05d}"
     except (ValueError, TypeError):
-        s = str(raw).strip().upper()
+        s = str(raw).strip().upper().lstrip("*").strip()
         if s.isdigit() and len(s) <= 6:
             return s
         if _ALPHA_CODE_RE.match(s):
             return s
         return None
+
+
+def _marker_text(value: str) -> str:
+    """Identity parser for the no-fixed-fee marker tiers ("I.C.", "c.s.",
+    "S.C.") -- returns the exact matched text as-is (whitespace-trimmed only),
+    rather than resolving it to a number or dropping it. A code with no
+    fixed fee is real, meaningful information (the source is telling us the
+    fee is individually costed / client-specific / a service charge), so the
+    reference sheet should show that literal text instead of a generic
+    "N/A", which would look the same as "the extractor found nothing at
+    all"."""
+    return value.strip()
 
 
 def extract_max_dollar(value) -> float | None:
@@ -125,6 +162,11 @@ def _fee_candidates(cell) -> list[float]:
         # Blank out the matched span (same length, so positions of
         # everything else are unaffected) so the plain-digit pass below
         # doesn't also re-match the digits inside it.
+        masked = masked[:m.start()] + " " * (m.end() - m.start()) + masked[m.end():]
+    for m in _FRENCH_GROUPED_NO_DOLLAR_RE.finditer(masked):
+        parsed = _parse_french_amount(m.group(0))
+        if parsed is not None:
+            matches.append((m.start(), parsed))
         masked = masked[:m.start()] + " " * (m.end() - m.start()) + masked[m.end():]
     for m in _DOLLAR_RE.finditer(masked):
         token = m.group(0)
@@ -210,10 +252,30 @@ def find_fee_column_indices(header) -> list[int]:
     vestigial column and the real data lives in "Suggested Fee", which would
     get wrongly excluded if "To" won as an exact match by itself) -- so it's
     only added here, and only when "From" is also an exact match in the same
-    header, confirming a genuine paired range rather than a stray "To"."""
+    header, confirming a genuine paired range rather than a stray "To".
+
+    A "Fee" / "UpperFee" pair is the SAME "take the ceiling" case, not the
+    opposite one this docstring used to claim: confirmed against AB's guide,
+    where a fracture-reduction code's "Fee" is $1,357.70 and "UpperFee" is
+    $1,697.10, and $1,697.10 is the correct fee -- consistent with how a
+    range is read everywhere else in this project (extract_max_dollar always
+    takes the largest end). "UpperFee" is appended after the exact "Fee"
+    match (only when "Fee" itself is an exact match, narrowly targeting the
+    word "upper" so it doesn't pull in some unrelated column that merely
+    contains "fee") so it still wins as the rightmost candidate even though
+    "Fee" alone would otherwise be returned outright."""
     exact = [i for i, h in enumerate(header) if h and str(h).strip().lower() in _EXACT_FEE_HEADER_NAMES]
     if exact and any(header[i] and str(header[i]).strip().lower() == "from" for i in exact):
         exact += [i for i, h in enumerate(header) if h and str(h).strip().lower() == "to"]
+    elif exact and any(header[i] and str(header[i]).strip().lower() == "fee" for i in exact):
+        # Require the header to be essentially just "upperfee"/"upper fee",
+        # not merely *contain* "upper" somewhere -- a broader substring
+        # match here turned out to sweep in unrelated columns (e.g. some
+        # other guide's "Upper Age Limit" note) that aren't a fee range at
+        # all, causing several other provinces' GP sheets to regress once
+        # this rule went in.
+        exact += [i for i, h in enumerate(header)
+                  if h and i not in exact and re.sub(r"\s+", "", str(h).strip().lower()) == "upperfee"]
     if exact:
         return exact
     return [i for i, h in enumerate(header) if h and _FEE_HEADER_RE.search(str(h))]
@@ -225,7 +287,7 @@ def find_code_column_indices(header) -> list[int]:
 
 def extract_codes_from_rows(
     tables, known_codes: set[str], target_specialty: str | None = None
-) -> dict[str, float]:
+) -> dict[str, float | str]:
     """Generic (code, fee) scanner for row-shaped tabular data.
 
     `tables` is an iterable of (header, data_rows) pairs -- one per
@@ -253,7 +315,7 @@ def extract_codes_from_rows(
     again under "END" at $139.30) -- without it, the first row encountered
     always wins regardless of which specialty it actually belongs to.
     """
-    fees: dict[str, float] = {}
+    fees: dict[str, float | str] = {}
     # code -> [(specialty_label_or_None, fee), ...], only populated when
     # target_specialty is given, since the single-pass "first row wins" path
     # above is enough (and already validated) for every other caller.
@@ -295,24 +357,23 @@ def extract_codes_from_rows(
 
                 fee = None
                 numeric_candidates = [float(c) for c in other_cells if isinstance(c, (int, float))]
-                # When no fee column is identifiable (header=None, so every
-                # column got scanned), a row whose intended fee cell is a
-                # standalone "I.C."/"c.s." marker (no fee, by design) can
-                # still have some *other*, unrelated real numeric cell in
-                # the row (e.g. a page number column) that would otherwise
-                # get mistaken for the fee -- skip the numeric fallback
-                # entirely in that case rather than risk picking it.
-                has_no_fee_marker = not fee_col_indices and any(
-                    isinstance(c, str) and _NO_FEE_MARKER_RE.match(c) for c in other_cells
-                )
-                if has_no_fee_marker:
-                    # This row's fee is explicitly non-numeric by design;
-                    # skip both the numeric and text fallbacks below
-                    # entirely rather than let some *other*, unrelated
-                    # numeric cell in the row (e.g. a page number column,
-                    # picked up by either fallback) be mistaken for it.
-                    continue
-                if numeric_candidates:
+                # A row whose fee cell is a standalone "I.C."/"c.s."/"S.C."/
+                # "lab" marker (no fixed fee, by design) resolves to that
+                # exact text rather than a number -- a code the source
+                # explicitly marks as individually costed/client-specific is
+                # meaningfully different from one where nothing could be
+                # found at all, and the reference sheet should show that
+                # literal marker instead of a generic "N/A". When no fee
+                # column is identifiable (header=None, so every column got
+                # scanned), this also has to block the numeric/text
+                # fallbacks below entirely -- otherwise some *other*,
+                # unrelated real numeric cell in the row (e.g. a page number
+                # column) would get mistaken for the fee instead.
+                no_fee_markers = [c.strip() for c in other_cells
+                                   if isinstance(c, str) and _NO_FEE_MARKER_RE.match(c)]
+                if no_fee_markers:
+                    fee = no_fee_markers[-1]
+                elif numeric_candidates:
                     fee = numeric_candidates[-1]
                 else:
                     text_candidates = [v for cell in other_cells for v in _fee_candidates(cell)]
@@ -524,12 +585,17 @@ def _parse_french_range_amount(text: str) -> float | None:
 #     years...") can outrank the real fee.
 #   - a "client specific" / "c.s." marker (no fixed fee -- extract_max_dollar
 #     finds no digits in it and returns None, which is the correct result)
+#   - a French-grouped whole number with no "$" and no decimals at all
+#     ("1 261") -- some Quebec guides print 4+-digit fees this way. Must
+#     come before the bare-number fallback below, which has no notion of
+#     digit-grouping and would otherwise split "1 261" on the space and
+#     take just the last group ("261") as if it were the whole fee.
 #   - finally a bare whole number with no "$" at all (some guides, e.g.
 #     Quebec's, list fees with no dollar sign or decimals -- riskiest, so
 #     tried last and only within a code's own text segment, see
 #     extract_codes_from_text).
 _FEE_TOKEN_TIERS = [
-    (re.compile(r"\d{1,3}(?:[\s ]\d{3})+(?:[.,]\d{2})?\s*\$"), _parse_french_amount),
+    (_FRENCH_GROUPED_SPACE_RE, _parse_french_amount),
     (re.compile(r"\d+[.,]\d{2}\s*\$"), _parse_french_amount),
     # Bare digits with trailing "$" and no thousands-grouping or decimals
     # ("97 $", "97 $ - 135 $") -- the two tiers above require grouping or a
@@ -540,14 +606,29 @@ _FEE_TOKEN_TIERS = [
     (re.compile(r"\$[\d,]+\.\d{2}(?:\s*(?:to|-)\s*\$?[\d,]+\.\d{2})?(?:\s*\+\s*[A-Za-z]+)*"), extract_max_dollar),
     (re.compile(r"\b[\d,]+\.\d{2}\b(?:\s*(?:to|-)\s*\$?[\d,]+\.\d{2})?(?:\s*\+\s*[A-Za-z]+)*"), extract_max_dollar),
     (re.compile(r"\$[\d,]+(?:\s*(?:to|-)\s*\$?[\d,]+)?(?:\s*\+\s*[A-Za-z]+)*"), extract_max_dollar),
-    (re.compile(r"c\.?\s*s\.?\s*\(?client specific\)?\.?", re.IGNORECASE), extract_max_dollar),
-    (re.compile(r"c\.?\s*s\.?", re.IGNORECASE), extract_max_dollar),
+    # These three no-fixed-fee markers resolve to the *exact matched text*
+    # (see _marker_text), not a number -- a code whose source says "I.C." is
+    # meaningfully different from one where no fee could be found at all,
+    # and the reference sheet should show that literal marker rather than a
+    # generic "N/A" that looks the same as an extraction failure. The
+    # internal "\s{0,2}" (rather than an unbounded "\s*") caps how much
+    # whitespace can separate the two letters: layout-mode PDF text pads
+    # rows out to their on-page column positions, so an unbounded "\s*"
+    # could span clear across that padding and glue together two entirely
+    # separate "S.C." occurrences many characters apart (seen in NB's DD
+    # guide) into one garbled, meaningless matched string -- capping it
+    # keeps the match to one genuine, tightly-printed occurrence of the
+    # marker instead. Harmless for plain-mode/spreadsheet text, where a real
+    # marker is never printed with more than a single separating space
+    # anyway.
+    (re.compile(r"c\.?\s{0,2}s\.?\s{0,2}\(?client specific\)?\.?", re.IGNORECASE), _marker_text),
+    (re.compile(r"c\.?\s{0,2}s\.?", re.IGNORECASE), _marker_text),
     # "I.C." ("Individually Costed") -- another no-fixed-fee marker, same
     # idea as "c.s." above. Without recognizing it, a code's segment like
     # "74112 1 - 2 cm I.C." falls through every tier here to the risky
     # bare-whole-number fallback below, which then misreads the "2" from
     # the size range ("1 - 2 cm") in the description as if it were a fee.
-    (re.compile(r"\bI\.?\s*C\.?\b", re.IGNORECASE), extract_max_dollar),
+    (re.compile(r"\bI\.?\s{0,2}C\.?\b", re.IGNORECASE), _marker_text),
     # "S.C." ("Service Charge"/"Independent Charge", per NB's DD guide) --
     # the same "no fixed fee" idea as "c.s." above, but with the two letters
     # reversed, so the "c.s." tier never matches it. Seen 136 times in NB's
@@ -555,7 +636,8 @@ _FEE_TOKEN_TIERS = [
     # (no digits at all -- just the word "S.C." itself) fails to match
     # anything all the way down to the bare-number tier too, so the code
     # never resolves at all, rather than correctly resolving to "no fee".
-    (re.compile(r"\bS\.?\s*C\.?\b", re.IGNORECASE), extract_max_dollar),
+    (re.compile(r"\bS\.?\s{0,2}C\.?\b", re.IGNORECASE), _marker_text),
+    (_FRENCH_GROUPED_NO_DOLLAR_RE, _parse_french_amount),
 ]
 _BARE_NUMBER_TIER = (re.compile(r"\b\d{1,4}\b"), extract_max_dollar)
 
@@ -566,11 +648,36 @@ _ANY_CODE_RE = re.compile(r"\b\d{5}\b")
 # sentences later.
 _SEGMENT_SEARCH_WINDOW = 700
 
+# pypdf's "layout" extraction mode (see load_fees_from_pdf) pads every line
+# out to match the page's on-screen column positions, so the same code-to-
+# fee distance that's a few characters in plain-mode text can be over a
+# thousand characters in layout-mode text purely from that padding -- one
+# QC DH guide table measured 1364 characters between one code and the next.
+# _SEGMENT_SEARCH_WINDOW's 700 silently truncated before ever reaching the
+# fee on some of those wide rows, so a code's segment then bled into the
+# next code's own row (whose fee was still within the truncated leftover of
+# the previous, already-bounded segment), misattributing a fee to the wrong
+# code entirely. This is only used for layout-mode text, not plain-mode's
+# (prose sources still want the tighter 700 -- widening it there raises the
+# risk of the risky bare-whole-number fallback tier wandering into an
+# unrelated number many sentences later in an ordinary paragraph).
+_LAYOUT_SEGMENT_SEARCH_WINDOW = 3000
+
 
 _YEAR_RE = re.compile(r"^(19|20)\d{2}$")
 
+# A page-number token ("PAGE 9") immediately preceding a bare number in a
+# segment -- seen when a code is the last one on its page, so its segment
+# runs on into the next page's header/footer noise (a recurring "Table of
+# contents\nPAGE 9\n<GUIDE TITLE> 2026" block, in QC's DH guide). Without
+# this, the risky bare-whole-number fallback tier (which takes the *last*
+# match in the window) picks up the page number instead of the real fee
+# that came right before it -- e.g. "...Minimum of 14 images 150\n...PAGE
+# 9..." resolved to 9 instead of 150.
+_PRECEDED_BY_PAGE_RE = re.compile(r"PAGE\s*$", re.IGNORECASE)
 
-def _fee_token_in_segment(segment: str) -> tuple[float | None, bool]:
+
+def _fee_token_in_segment(segment: str, window_size: int = _SEGMENT_SEARCH_WINDOW) -> tuple[float | str | None, bool]:
     """Find the fee within one code's text segment.
 
     For the specific tiers (dollar amounts, decimals, "c.s."/"I.C." markers)
@@ -591,7 +698,7 @@ def _fee_token_in_segment(segment: str) -> tuple[float | None, bool]:
     paragraph referencing it before its actual price-table entry appears
     later) and shouldn't block a later, real entry from being found.
     """
-    window = segment[:_SEGMENT_SEARCH_WINDOW]
+    window = segment[:window_size]
     for pattern, parser in _FEE_TOKEN_TIERS:
         last_valid = None
         for match in pattern.finditer(window):
@@ -613,6 +720,8 @@ def _fee_token_in_segment(segment: str) -> tuple[float | None, bool]:
     for match in bare_pattern.finditer(window):
         text = match.group(0)
         if _YEAR_RE.match(text.strip()):
+            continue
+        if _PRECEDED_BY_PAGE_RE.search(window[:match.start()]):
             continue
         last_valid = text
     if last_valid is not None:
@@ -671,7 +780,9 @@ def _is_cross_reference(text: str, pos: int) -> bool:
     return bool(_FOLLOWED_BY_LIST_PUNCTUATION_RE.match(following))
 
 
-def extract_codes_from_text(text: str, known_codes: set[str]) -> dict[str, float]:
+def extract_codes_from_text(
+    text: str, known_codes: set[str], window_size: int = _SEGMENT_SEARCH_WINDOW
+) -> dict[str, float | str]:
     """Segment `text` by occurrences of *any* 5-digit code (not just ones we
     care about), then look for a fee token within each known code's segment
     (the text up to the next code of any kind). Bounding on any code --
@@ -699,7 +810,7 @@ def extract_codes_from_text(text: str, known_codes: set[str]) -> dict[str, float
         m for m in _ANY_CODE_RE.finditer(text) if not _is_cross_reference(text, m.start())
     ]
 
-    fees: dict[str, float] = {}
+    fees: dict[str, float | str] = {}
     seen: set[str] = set()
     for i, m in enumerate(all_matches):
         code = m.group(0)
@@ -707,7 +818,7 @@ def extract_codes_from_text(text: str, known_codes: set[str]) -> dict[str, float
             continue
         next_start = all_matches[i + 1].start() if i + 1 < len(all_matches) else len(text)
         segment = text[m.end():next_start]
-        fee, found_something = _fee_token_in_segment(segment)
+        fee, found_something = _fee_token_in_segment(segment, window_size)
         if found_something:
             seen.add(code)
         if fee is not None:
@@ -715,7 +826,7 @@ def extract_codes_from_text(text: str, known_codes: set[str]) -> dict[str, float
     return fees
 
 
-def load_fees_from_pdf(path: Path, known_codes: set[str]) -> dict[str, float]:
+def load_fees_from_pdf(path: Path, known_codes: set[str]) -> dict[str, float | str]:
     reader = pypdf.PdfReader(str(path))
     plain_text = "\n".join(page.extract_text() or "" for page in reader.pages)
     plain_fees = extract_codes_from_text(plain_text, known_codes)
@@ -736,11 +847,11 @@ def load_fees_from_pdf(path: Path, known_codes: set[str]) -> dict[str, float]:
     layout_text = "\n".join(
         page.extract_text(extraction_mode="layout") or "" for page in reader.pages
     )
-    layout_fees = extract_codes_from_text(layout_text, known_codes)
+    layout_fees = extract_codes_from_text(layout_text, known_codes, window_size=_LAYOUT_SEGMENT_SEARCH_WINDOW)
     return layout_fees if len(layout_fees) > len(plain_fees) else plain_fees
 
 
-def load_fees_from_docx(path: Path, known_codes: set[str], target_specialty: str | None = None) -> dict[str, float]:
+def load_fees_from_docx(path: Path, known_codes: set[str], target_specialty: str | None = None) -> dict[str, float | str]:
     fees = extract_codes_from_rows(tables_from_docx(path), known_codes, target_specialty)
     missing = known_codes - fees.keys()
     if missing:
@@ -753,7 +864,7 @@ def load_fees_from_docx(path: Path, known_codes: set[str], target_specialty: str
     return fees
 
 
-def load_fees_from_spreadsheet(path: Path, known_codes: set[str], target_specialty: str | None = None) -> dict[str, float]:
+def load_fees_from_spreadsheet(path: Path, known_codes: set[str], target_specialty: str | None = None) -> dict[str, float | str]:
     if target_specialty is not None:
         # If any worksheet's title identifies it as specific to the
         # requested sub-specialty (e.g. QC's combined SP guide splits
@@ -777,7 +888,7 @@ def load_fees_from_spreadsheet(path: Path, known_codes: set[str], target_special
     return extract_codes_from_rows(tables_from_spreadsheet(path), known_codes, target_specialty)
 
 
-def load_fees_from_csv(path: Path, known_codes: set[str], target_specialty: str | None = None) -> dict[str, float]:
+def load_fees_from_csv(path: Path, known_codes: set[str], target_specialty: str | None = None) -> dict[str, float | str]:
     return extract_codes_from_rows(tables_from_csv(path), known_codes, target_specialty)
 
 
@@ -841,7 +952,7 @@ def load_pt_fees_from_files(
 
     Returns (fees dict, list of (source_description, codes_found) used).
     """
-    fees: dict[str, float] = {}
+    fees: dict[str, float | str] = {}
     sources_used: list[tuple[str, int]] = []
 
     def _apply(label: str, new_fees: dict[str, float]):
@@ -1159,17 +1270,24 @@ def extract_dd_codes_from_pdf_text(text: str, known_codes: set[str]) -> dict[str
     TOTAL FEE") doesn't even name a "Lab" column at all; the breakdown only
     shows up as a third number on the rows that have one.
 
-    A line with exactly one number after the code is Total only (Prof/Lab
-    genuinely undifferentiated, same as the generic scanner). Exactly two
-    IDENTICAL numbers is common for procedures with no lab component at all
-    (Clinical Fee == Total Fee); recorded as Total with Lab forced to 0.0,
-    not left unknown, matching this project's established "a genuinely
-    blank side is 0, not unknown" DD convention (see
-    extract_dd_codes_from_rows). Three or more numbers is read as (prof,
-    lab, total) -- but only kept as such if it actually satisfies prof +
-    lab == total (within a cent); otherwise treated as Total-only, so a
-    line with other, unrelated numbers on it isn't misread as a real
-    Prof/Lab/Total triple.
+    Only the two HIGH-CONFIDENCE shapes are claimed here:
+    - Exactly two IDENTICAL numbers, common for procedures with no lab
+      component at all (Clinical Fee == Total Fee); recorded as Total with
+      Lab forced to 0.0, not left unknown, matching this project's
+      established "a genuinely blank side is 0, not unknown" DD convention
+      (see extract_dd_codes_from_rows).
+    - Three or more numbers read as (prof, lab, total), kept only if it
+      actually satisfies prof + lab == total (within a cent).
+
+    Every other shape (exactly one number, two unequal numbers, or 3+
+    numbers that don't satisfy the arithmetic check) is left unclaimed
+    rather than guessed at, so those codes fall through to the generic
+    single-fee fallback (load_pt_fees_from_files) in
+    load_pt_dd_fees_from_files instead. Guessing in those low-confidence
+    cases used to work fine for NB (the guide this scanner was built and
+    tested against), but wrongly intercepted codes on other provinces' DD
+    PDFs that the older, more robust generic fallback already resolved
+    correctly.
     """
     results: dict[str, dict[str, float]] = {}
     for line in text.split("\n"):
@@ -1188,10 +1306,19 @@ def extract_dd_codes_from_pdf_text(text: str, known_codes: set[str]) -> dict[str
             prof, lab, total = numbers[0], numbers[1], numbers[-1]
             if abs((prof + lab) - total) < 0.01:
                 results[code] = {"prof": prof, "lab": lab, "total": total}
-            else:
-                results[code] = {"total": numbers[-1]}
-        else:
-            results[code] = {"total": numbers[-1]}
+            # else: numbers on the line don't satisfy prof+lab=total, so this
+            # isn't confidently a Prof/Lab/Total triple -- leave the code
+            # unclaimed rather than guessing, so it falls through to the
+            # generic single-fee fallback (load_pt_fees_from_files) in
+            # load_pt_dd_fees_from_files instead.
+        # else (exactly one number): also not confident enough to claim here
+        # -- same fallthrough to the generic fallback. Both of these
+        # low-confidence branches used to record a bare {"total": ...} guess
+        # directly, which was fine for NB (the guide this scanner was built
+        # and tested against) but wrongly intercepted codes on other
+        # provinces' DD PDFs (e.g. PE) that the older, more robust generic
+        # fallback already resolved correctly -- causing a regression when
+        # this tier was made to run on every DD PDF, not just NB's.
     return results
 
 
@@ -1578,7 +1705,14 @@ def load_pt_fees_by_subspecialty(
                     mult = _multiplier_for_code(code, ranges)
                     if gp_fee is None or mult is None:
                         continue
-                    fees[(code, sub_specialty)] = gp_fee * mult
+                    # gp_fee can now be a no-fixed-fee marker string (e.g.
+                    # "I.C.", see _marker_text) instead of a number -- there's
+                    # no numeric base to apply the specialist markup to, so
+                    # carry the marker text through unchanged rather than
+                    # crash trying to multiply it.
+                    fees[(code, sub_specialty)] = (
+                        gp_fee * mult if isinstance(gp_fee, (int, float)) else gp_fee
+                    )
                     applied += 1
                 if applied:
                     sources_used.append((f"GP fee x specialist markup ({applied})", applied))

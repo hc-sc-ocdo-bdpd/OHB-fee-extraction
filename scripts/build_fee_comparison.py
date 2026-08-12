@@ -85,6 +85,11 @@ PLAUSIBILITY_MAX_RATIO = 6.0
 def report_plausibility(cdcp_fees: dict[str, float], pt_fees: dict[str, float]) -> None:
     suspects = []
     for code, pt_fee in pt_fees.items():
+        if not isinstance(pt_fee, (int, float)):
+            # A no-fixed-fee marker like "I.C."/"c.s." (see
+            # fee_extraction._marker_text) isn't a numeric fee to begin
+            # with, so there's no ratio to sanity-check here.
+            continue
         cdcp_fee = cdcp_fees.get(code)
         if not cdcp_fee:
             continue

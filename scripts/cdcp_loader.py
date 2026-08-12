@@ -25,6 +25,26 @@ from fee_extraction import normalize_code
 # uses "YT". Without this, looking up "YT" finds no file at all.
 CDCP_PROVINCE_ALIASES: dict[str, str] = {"YT": "YK"}
 
+# Some CDCP price files are internally inconsistent about their own
+# 'Province' column: QC's file uses "QC" for every row except a block of
+# P-series GP codes (P0500-P1700) near the end of the sheet, which use "PQ"
+# ("Province de Québec") instead -- confirmed by inspecting the file
+# directly (row 342 is "QC"/99111, row 343 onward is "PQ"/P0500...). Without
+# this, those 12 rows' Province never equals the "QC" we're filtering for,
+# so load_cdcp_simple_fees silently drops them -- not an extraction bug,
+# just an inconsistent label within one file that needs to be tolerated.
+# The canonical `province` argument (not the file's own "PQ" label) is what
+# ends up written to the output sheet's PT column, since these loaders only
+# return code->fee data -- build_fee_comparison.py supplies the label --
+# so accepting "PQ" here doesn't leak an inconsistent label into the output.
+CDCP_ROW_PROVINCE_ALIASES: dict[str, set[str]] = {
+    "QC": {"QC", "PQ"},
+}
+
+
+def _row_matches_province(row_province, province: str, data_province: str) -> bool:
+    return row_province in CDCP_ROW_PROVINCE_ALIASES.get(province, {data_province})
+
 
 def _load_sheet(cdcp_dir: Path, province: str, sheet_name: str):
     file_province = CDCP_PROVINCE_ALIASES.get(province, province)
@@ -58,7 +78,7 @@ def load_cdcp_simple_fees(
 
     fees: dict[str, float | None] = {}
     for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[idx["Province"]] != data_province or row[idx["Specialty"]] != specialty:
+        if not _row_matches_province(row[idx["Province"]], province, data_province) or row[idx["Specialty"]] != specialty:
             continue
         fee = row[idx["Provider Fee"]]
         if fee is None and require_fee:
@@ -81,14 +101,24 @@ def load_cdcp_sp_rows(cdcp_dir: Path, province: str, require_fee: bool = True) -
 
     rows = []
     for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[idx["Province"]] != data_province:
+        if not _row_matches_province(row[idx["Province"]], province, data_province):
             continue
         fee = row[idx["Provider Fee"]]
         if fee is None and require_fee:
             continue
-        code = normalize_code(row[idx["Procedure Code"]])
+        raw_code = row[idx["Procedure Code"]]
+        code = normalize_code(raw_code)
+        if code is None:
+            # A handful of QC SP rows use an unusual composite code instead
+            # of a plain 5-digit/alphanumeric one (e.g. "PS407/12250 age
+            # 0-11", a pediatric age-based surcharge code) -- normalize_code
+            # rejects that shape entirely, silently dropping the row. Since
+            # there's no simpler canonical form to reduce it to, fall back
+            # to the raw string as-is (matching this project's reference
+            # output, which does the same) rather than losing the row.
+            code = str(raw_code).strip() if raw_code else None
         sub_specialty = row[idx["Specialty"]]
-        if code is None or not sub_specialty:
+        if not code or not sub_specialty:
             continue
         rows.append((code, sub_specialty, float(fee) if fee is not None else None))
     return rows
@@ -103,7 +133,7 @@ def load_cdcp_dd_fees(cdcp_dir: Path, province: str) -> dict[str, tuple[float, f
 
     fees: dict[str, tuple[float, float]] = {}
     for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[idx["Province"]] != data_province or row[idx["Specialty"]] != "DD":
+        if not _row_matches_province(row[idx["Province"]], province, data_province) or row[idx["Specialty"]] != "DD":
             continue
         prof_fee = row[idx["Provider Fee"]]
         if prof_fee is None:
