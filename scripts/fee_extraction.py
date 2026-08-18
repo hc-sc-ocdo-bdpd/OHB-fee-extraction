@@ -461,8 +461,13 @@ def tables_from_spreadsheet_by_sheet(path: Path):
 _SHEET_SPECIALTY_SUBSTRINGS: dict[str, list[str]] = {
     "EN": ["ENDODONTIE"],
     "OS": ["MAXILLO-FACIALE", "MAXILLOFACIAL"],
-    "PA": ["PARODONTIE"],
-    "PE": ["DIATRIQUE"],
+    # CDCP's "PA"/"PE" codes are the reverse of what their letters suggest:
+    # "PA" is Pediatric Dentistry, "PE" is Periodontics (see
+    # SUBSPECIALTY_FILE_MARKERS for how this was confirmed). "PARODONTIE" is
+    # French for Periodontics -> "PE"; "DIATRIQUE" (surviving fragment of
+    # "Pédiatrique", Pediatric) -> "PA".
+    "PE": ["PARODONTIE"],
+    "PA": ["DIATRIQUE"],
     "PR": ["PROSTHODONTIE"],
     "OR": ["ORTHODONTIE"],
 }
@@ -746,6 +751,33 @@ _FOLLOWED_BY_PERIOD_RE = re.compile(r"^\s?\.")
 _FOLLOWED_BY_RANGE_RE = re.compile(r"^\s*-")
 _FOLLOWED_BY_LIST_PUNCTUATION_RE = re.compile(r"^\s*[,)]")
 
+# Marks the start of a back-of-guide numeric index (code -> page number),
+# seen in QC's GP guide as several pages headed "INDEX / CODE NUMÉRIQUE
+# NUMERICAL CODE" listing every code, followed by a separately-printed
+# block of page numbers. In plain-mode (draw-order) text this is harmless
+# on its own -- a code's segment there is just the next code with nothing
+# in between, so _fee_token_in_segment finds nothing and doesn't lock it
+# in. But in *layout* mode, which reconstructs the index's two columns
+# (code, page number) side by side, each code ends up immediately followed
+# by its page number -- and the bare-number fallback tier then misreads
+# that page number as the code's fee (e.g. code 11300 wrongly resolving to
+# "454", a page number, instead of its real fee). Since an index is purely
+# a cross-reference to *where* a code's real entry lives, never a source of
+# fee data itself, every code occurrence from this marker to the end of the
+# text is excluded from consideration entirely -- same treatment as a
+# prose cross-reference (see _is_cross_reference), just spanning a whole
+# section instead of a few words.
+#
+# Deliberately matched on just the "CODE NUMÉRIQUE ... NUMERICAL CODE"
+# bilingual column-header phrase, not the "INDEX" page heading that
+# precedes it in plain-mode text: layout mode's column reconstruction
+# scatters "INDEX" and the page number to a different position relative to
+# this phrase (confirmed against the actual guide), so anchoring on
+# "INDEX" first would silently fail to match layout-mode text and let this
+# exact bug back in through that mode. The bilingual header phrase itself
+# is positioned consistently in both modes.
+_BACK_MATTER_INDEX_RE = re.compile(r"CODE\s+NUM\S*\s+NUMERICAL\s+CODE", re.IGNORECASE)
+
 
 def _is_cross_reference(text: str, pos: int) -> bool:
     preceding = _PRECEDING_WORD_RE.search(text[max(0, pos - 30):pos])
@@ -805,7 +837,16 @@ def extract_codes_from_text(
     nearby) isn't treated as authoritative, so a later, real entry still
     gets a chance -- otherwise a code mentioned in passing before its own
     definition would never resolve.
+
+    Text from the start of a back-of-guide numeric index onward (see
+    _BACK_MATTER_INDEX_RE) is excluded entirely first, before any of the
+    above -- an index's code->page-number pairing must never be mistaken
+    for a code->fee pairing.
     """
+    index_start = _BACK_MATTER_INDEX_RE.search(text)
+    if index_start is not None:
+        text = text[:index_start.start()]
+
     all_matches = [
         m for m in _ANY_CODE_RE.finditer(text) if not _is_cross_reference(text, m.start())
     ]
@@ -823,6 +864,92 @@ def extract_codes_from_text(
             seen.add(code)
         if fee is not None:
             fees[code] = fee
+    return fees
+
+
+def load_fees_from_abbreviated_pdf(path: Path, known_codes: set[str]) -> dict[str, float]:
+    """Positional-pairing reader for "abbreviated"/condensed fee guides
+    (e.g. QC's "GUIDE ABRÉGÉ") laid out as two side-by-side columns per
+    page -- a dense list of (code, description) entries on the left, and
+    just the corresponding fees on the right, with no other text mixed in.
+
+    pypdf's plain-mode (draw-order) extraction serializes this exactly
+    column-major, same problem as NB's DD guide: every code+description
+    entry for the whole page comes first, then every fee for the whole
+    page afterward, as two separate un-paired blocks. Unlike NB's guide,
+    though, *layout* mode doesn't reliably fix it here either -- confirmed
+    against the real file, layout mode still misattributes fees (a code's
+    search window ends up running past several other codes' worth of
+    content because some of them fail to re-parse as clean 5-digit runs in
+    the reconstructed layout, the same kind of split-digit artifact seen
+    elsewhere in QC's guides).
+
+    Since both blocks are internally *in the same relative order* (each
+    fee is the Nth fee for the Nth code), the reliable fix is positional:
+    read off every code in first-occurrence order, then every fee-shaped
+    line in the trailing block in order, and pair them up index-for-index
+    -- not a text-proximity heuristic at all, which is what makes this
+    immune to both the column-major and split-digit problems above.
+
+    This only actually pairs anything on a page where the two lists come
+    out the *same length* -- if they don't, something about that page
+    doesn't match this guide's assumed structure (or this isn't this kind
+    of guide at all), and guessing a pairing anyway risks silently
+    mismatching every code after the first discrepancy, which is worse
+    than resolving nothing. That length check is also what makes this
+    reader self-gating: run against an ordinary (non-abbreviated) guide,
+    essentially no page will happen to have equal-length code and
+    fee-shaped-line lists, so it naturally contributes nothing there
+    instead of needing to be turned on per-province.
+
+    That self-gating length check is NOT enough on its own, though: a
+    back-of-guide numeric index page (see _BACK_MATTER_INDEX_RE) is
+    *also* a list of codes followed by a same-length list of numbers --
+    just page numbers, not fees -- so it can coincidentally pass the same
+    check and get its page numbers paired in as if they were real fees
+    (confirmed against QC's actual guide). Every page from the first
+    index marker onward is skipped entirely for exactly that reason.
+    """
+    reader = pypdf.PdfReader(str(path))
+    fees: dict[str, float] = {}
+    past_index_start = False
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        if not past_index_start and _BACK_MATTER_INDEX_RE.search(text):
+            past_index_start = True
+        if past_index_start:
+            continue
+        code_matches = list(_ANY_CODE_RE.finditer(text))
+        if not code_matches:
+            continue
+        codes_in_order: list[str] = []
+        seen_on_page: set[str] = set()
+        for m in code_matches:
+            code = m.group(0)
+            if code not in seen_on_page:
+                seen_on_page.add(code)
+                codes_in_order.append(code)
+
+        tail = text[code_matches[-1].end():]
+        fee_lines = [
+            line for line in (raw.strip() for raw in tail.split("\n"))
+            # A genuine fee-block line always starts with a digit; this
+            # also naturally excludes leftover wrapped description text
+            # from the page's last code (never starts with a digit) and a
+            # stray running-header/footer year label like "2026" (starts
+            # with a digit but is exactly a bare year, same exclusion
+            # _fee_token_in_segment already applies elsewhere).
+            if line and re.match(r"^\d", line) and not _YEAR_RE.match(line)
+        ]
+        if len(fee_lines) != len(codes_in_order):
+            continue
+
+        for code, fee_text in zip(codes_in_order, fee_lines):
+            if code not in known_codes or code in fees:
+                continue
+            candidates = _fee_candidates(fee_text)
+            if candidates:
+                fees[code] = candidates[-1]
     return fees
 
 
@@ -1002,6 +1129,21 @@ def load_pt_fees_from_files(
         (f for f in files if f.suffix.lower() in PDF_SUFFIXES),
         key=lambda f: not _is_english(f),  # English first
     )
+    # Tried before the generic PDF scanner below: a condensed/"abbreviated"
+    # companion guide (see load_fees_from_abbreviated_pdf) that lays a
+    # province's *entire* fee schedule out compactly, in a shape the
+    # generic scanner can't reliably read even with its layout-mode
+    # fallback. Safe to try unconditionally first across every source's
+    # PDFs -- it only ever pairs anything on a page whose code count and
+    # fee-line count match exactly, so it contributes nothing (not wrong
+    # guesses, just nothing) for a PDF that isn't actually this shape.
+    for f in pdfs:
+        if known_codes - fees.keys():
+            try:
+                _apply(f"{f.name} (abbreviated)", load_fees_from_abbreviated_pdf(f, known_codes))
+            except Exception as e:
+                if verbose:
+                    print(f"    WARNING: failed to read {f.name} as an abbreviated guide: {e}")
     for f in pdfs:
         if known_codes - fees.keys():
             try:
@@ -1450,16 +1592,28 @@ def resolve_dd_role_values(values: dict[str, float]) -> tuple[float | None, floa
 
 
 # Maps a CDCP SP sub-specialty code to name fragments that identify a PT fee
-# guide file as specific to that sub-specialty (e.g. "ON PA Fee Guide.xlsx",
-# "MDA 2026 Periodontics....xlsx" both indicate Periodontics -> "PA"). Used
+# guide file as specific to that sub-specialty (e.g. "ON PE Fee Guide.xlsx",
+# "MDA 2026 Periodontics....xlsx" both indicate Periodontics -> "PE"). Used
 # to prefer a sub-specialty-specific guide's fee over a general/all-specialty
 # guide's fee for the same code, since the same procedure code commonly has
 # a genuinely different fee depending on which specialty bills it.
+# CDCP's own two-letter specialty codes are counter-intuitive for these two
+# in particular -- "PA" is Pediatric Dentistry and "PE" is Periodontics, the
+# reverse of what the letters would suggest. Confirmed directly against
+# PE's own CDCP price file: codes 01501/01502/01503, which PE's own PT fee
+# guide explicitly labels "PER" (Periodontal exam codes), are assigned CDCP
+# specialty "PE" -- and separately, codes 23411-23512 ("Primary Anterior"/
+# "Primary Posterior" tooth-coloured restorations -- baby-tooth fillings,
+# squarely Pediatric Dentistry's domain, not Periodontics') are assigned
+# CDCP specialty "PA". (This was previously backwards here, which is what
+# caused several provinces' SP sheets' Pediatric/Periodontics rows to
+# apparently "swap" against the ground truth -- the ground truth was right,
+# this mapping was wrong.)
 SUBSPECIALTY_FILE_MARKERS: dict[str, list[str]] = {
     "EN": ["EN", "END", "ENDO", "ENDODONTIC", "ENDODONTICS"],
     "OS": ["OS", "OMS", "ORAL SURGERY", "ORAL AND MAXILLOFACIAL SURGERY", "MAXILLOFACIAL"],
-    "PA": ["PA", "PER", "PERIODONTIC", "PERIODONTICS", "PERIODONTOLOGY"],
-    "PE": ["PE", "PED", "PEDIATRIC", "PEDIATRICS", "PAEDIATRIC", "PAEDIATRICS"],
+    "PA": ["PA", "PED", "PEDIATRIC", "PEDIATRICS", "PAEDIATRIC", "PAEDIATRICS"],
+    "PE": ["PE", "PER", "PERIODONTIC", "PERIODONTICS", "PERIODONTOLOGY"],
     "PR": ["PR", "PROSTHODONTIC", "PROSTHODONTICS"],
     "OM": ["OM", "ORAL MEDICINE"],
     "OP": ["OP", "ORAL PATHOLOGY"],
@@ -1486,8 +1640,29 @@ for _code, _markers in SUBSPECIALTY_FILE_MARKERS.items():
     for _marker in _markers:
         _ALL_SPECIALTY_MARKERS.setdefault(_marker, _code)
 
+# Some SP guides label each row's specialty with a small internal
+# reference *number* instead of a letter abbreviation -- confirmed in SK's
+# Specialist Fee Guide, whose own numeric column uses 21-30 as
+# section/category numbers, cross-checked against that guide's own section
+# headings (e.g. 24 = "PERIODONTICS, ...", 29 = "ENDODONTIC SERVICES").
+# Only mapped where a number corresponds to exactly one CDCP sub-specialty
+# -- SK's "28" section merges Oral Medicine and Oral Pathology together
+# under one number with no way to tell them apart from the number alone,
+# and 21/22/30 are generic categories (Diagnostic, Radiology, Adjunctive)
+# that aren't any one sub-specialty at all -- so those are deliberately
+# left unmapped rather than guessed at (see _classify_specialty_cell).
+_NUMERIC_SPECIALTY_MARKERS: dict[int, str] = {
+    23: "PA",  # SK: "PEDIATRIC, ..." -- CDCP's "PA" is Pediatric Dentistry
+    24: "PE",  # SK: "PERIODONTICS, ..." -- CDCP's "PE" is Periodontics
+    25: "OS",  # SK: "ORAL&MAXILLOFACIAL SURG"
+    26: "PR",  # SK: "PROSTHO SERV..."
+    29: "EN",  # SK: "ENDODONTIC..."
+}
+
 
 def _classify_specialty_cell(cell) -> str | None:
+    if isinstance(cell, (int, float)) and float(cell).is_integer():
+        return _NUMERIC_SPECIALTY_MARKERS.get(int(cell))
     if not isinstance(cell, str):
         return None
     return _ALL_SPECIALTY_MARKERS.get(cell.strip().upper())
@@ -1525,15 +1700,15 @@ def find_row_specialty_column(rows) -> int | None:
 
 def classify_file_specialty(path: Path, province: str | None = None) -> set[str]:
     """Which CDCP sub-specialty code(s), if any, a PT fee guide filename
-    identifies (e.g. "ON PA Fee Guide 2026.xlsx" -> {"PA"}). Empty set means
+    identifies (e.g. "ON PE Fee Guide 2026.xlsx" -> {"PE"}). Empty set means
     the file isn't specific to one sub-specialty (e.g. a general/combined
     guide like "ON DA Fee Guide" or "BC LTC Fee Guide").
 
     If `province` is given, its aliases (see PROVINCE_ALIASES) are stripped
     from the start of the name before matching -- otherwise a filename like
     "PE GP SP LTC Fee Guide" (Prince Edward Island's combined guide) gets
-    misread as Pediatric-specific, since "PE" is coincidentally both the
-    province's abbreviation and the Pediatric specialty marker.
+    misread as Periodontics-specific, since "PE" is coincidentally both the
+    province's abbreviation and the Periodontics specialty marker.
     """
     name = path.stem.upper()
     if province:
@@ -1583,13 +1758,13 @@ def _is_context_restricted(path: Path) -> bool:
 # specialist-specific rate elsewhere.
 _SPECIALIST_NOUN_TO_SUBSPECIALTY: dict[str, str] = {
     "PROSTHODONTIST": "PR",
-    "PERIODONTIST": "PA",
+    "PERIODONTIST": "PE",
     "ENDODONTIST": "EN",
     "ORTHODONTIST": "OR",
     "ORAL AND MAXILLO-FACIAL SURGEON": "OS",
     "ORAL SURGEON": "OS",
-    "PAEDIATRIC DENTIST": "PE",
-    "PEDIATRIC DENTIST": "PE",
+    "PAEDIATRIC DENTIST": "PA",
+    "PEDIATRIC DENTIST": "PA",
 }
 _MULTIPLIER_APPENDIX_RE = re.compile(
     r"SERVICES PROVIDED BY (?:A |AN |CERTIFIED )*([A-Za-z][A-Za-z \-]*?)\s*\n"
