@@ -53,8 +53,10 @@ _FRENCH_GROUPED_NO_DOLLAR_RE = re.compile(r"(?<!\d)\d{1,3}(?:[\s ]\d{3})+(?:[.,
 # its own alternative here, a cell/segment whose only content is "S.C."
 # isn't recognized as a marker at all, so has_no_fee_marker (below, and in
 # _FEE_TOKEN_TIERS) never fires for it and it just resolves to nothing.
+# "B.R." ("By Report") is AB's DD guide's own version of the same idea --
+# the fee is individually assessed and reported, not fixed.
 _NO_FEE_MARKER_RE = re.compile(
-    r"^\s*(?:I\.?\s*C\.?|c\.?\s*s\.?|s\.?\s*c\.?|(?:actual\s+)?lab(?:\s+fee)?)\s*\.?\s*$",
+    r"^\s*(?:I\.?\s*C\.?|c\.?\s*s\.?|s\.?\s*c\.?|(?:actual\s+)?lab(?:\s+fee)?|B\.?\s*R\.?)\s*\.?\s*$",
     re.IGNORECASE,
 )
 
@@ -276,9 +278,28 @@ def find_fee_column_indices(header) -> list[int]:
         # this rule went in.
         exact += [i for i, h in enumerate(header)
                   if h and i not in exact and re.sub(r"\s+", "", str(h).strip().lower()) == "upperfee"]
-    if exact:
-        return exact
-    return [i for i, h in enumerate(header) if h and _FEE_HEADER_RE.search(str(h))]
+    fee_cols = exact if exact else [i for i, h in enumerate(header) if h and _FEE_HEADER_RE.search(str(h))]
+
+    # A fee-like column immediately followed by a column with *no* header
+    # text at all, or literally headed "To", is very likely an unlabeled or
+    # lightly-labeled ceiling-of-range companion -- seen in several ON SP
+    # guides: "Fee" / <blank> in the EN and PE guides (confirmed against
+    # real codes, e.g. 01204, where the blank column held the reference's
+    # actual expected fee while "Fee" held a lower, superseded value), and
+    # "Suggested Fee " / "To" in the OS guide, which an earlier version of
+    # this function dismissed as "just an unused vestigial column" -- that
+    # was wrong for at least those same codes. Only the column immediately
+    # adjacent is considered, not a blank column found anywhere else in the
+    # header, so an unrelated blank formatting column elsewhere in the
+    # sheet isn't swept in.
+    for i in list(fee_cols):
+        if i + 1 < len(header) and i + 1 not in fee_cols:
+            companion = header[i + 1]
+            is_blank = companion is None or (isinstance(companion, str) and not companion.strip())
+            is_to = isinstance(companion, str) and companion.strip().lower() == "to"
+            if is_blank or is_to:
+                fee_cols.append(i + 1)
+    return fee_cols
 
 
 def find_code_column_indices(header) -> list[int]:
@@ -1393,24 +1414,38 @@ def extract_dd_codes_from_rows(tables, known_codes: set[str]) -> dict[str, dict[
 _DD_PDF_LINE_CODE_RE = re.compile(r"\b(\d{5})\b")
 _DD_PDF_NUMBER_RE = re.compile(r"\d[\d,]*\.\d{2}")
 
+# A Prof fee immediately followed by a Lab fee marked "+L" -- a variable,
+# unspecified additional lab charge, not a fixed number (seen in PE's DD
+# guide, e.g. "1604.00   789+L   2393.00+L": Prof $1604, Lab "$789 plus an
+# unspecified lab surcharge", Total likewise "+L"). "789" and "2393.00" here
+# have no decimal point-free digit run before them respectively that would
+# make them safe to read as a second/third fixed number the way the
+# Prof/Lab/Total tier above does -- Lab and Total are genuinely variable
+# here, not just unresolved, so only Prof (the one unambiguous, fixed
+# number on the line) is claimed.
+_DD_VARIABLE_LAB_RE = re.compile(r"(\d[\d,]*\.\d{2})\s*[\t ]*\d[\d,]*\s*\+\s*L\b")
 
-def extract_dd_codes_from_pdf_text(text: str, known_codes: set[str]) -> dict[str, dict[str, float]]:
-    """DD-specific PDF scanner for guides (so far only NB's) that print a
-    code's Prof/Lab/Total fees together on the same line, in that left-to-
-    right order -- e.g. "Diagnostic Model - Maxillary   10120   122.00
-    184.00   306.00" (confirmed left-to-right by Total == Prof + Lab in
-    every such line). `text` should be pdf "layout" extraction-mode text
-    (see load_fees_from_pdf) -- plain-mode text serializes multi-column
-    tables in draw order, scattering a row's numbers away from its code
-    entirely, so there'd be nothing to find on the code's own line at all.
 
-    The generic single-fee PDF scanner (load_fees_from_pdf) can only ever
-    take one number per code (the rightmost, i.e. Total), silently losing
-    the Prof/Lab breakdown for any such row. This recovers it directly from
-    the numbers on the same line as the code, without needing a
-    recognizable column header -- NB's own header ("CODE / CLINICAL FEE /
-    TOTAL FEE") doesn't even name a "Lab" column at all; the breakdown only
-    shows up as a third number on the rows that have one.
+def extract_dd_codes_from_lines(text: str, known_codes: set[str]) -> dict[str, dict[str, float]]:
+    """DD-specific line scanner for guides that print a code's Prof/Lab/Total
+    fees together on the same line, in that left-to-right order -- e.g.
+    "Diagnostic Model - Maxillary   10120   122.00   184.00   306.00"
+    (confirmed left-to-right by Total == Prof + Lab in every such line).
+    Format-agnostic despite the name's origin (it was built for pdf "layout"
+    extraction-mode text, see load_fees_from_pdf -- plain-mode text
+    serializes multi-column tables in draw order, scattering a row's numbers
+    away from its code entirely) -- it works equally well on docx paragraph
+    text (see docx_paragraph_text), confirmed against PE's DD guide, whose
+    fee table isn't a real Word table at all, just tab-separated paragraphs
+    ("31112\\t\\t1118.00\\t\\t746.00\\t\\t1864.00").
+
+    The generic single-fee scanner (load_fees_from_pdf / load_fees_from_docx)
+    can only ever take one number per code (the rightmost, i.e. Total),
+    silently losing the Prof/Lab breakdown for any such row. This recovers
+    it directly from the numbers on the same line as the code, without
+    needing a recognizable column header -- NB's own header ("CODE /
+    CLINICAL FEE / TOTAL FEE") doesn't even name a "Lab" column at all; the
+    breakdown only shows up as a third number on the rows that have one.
 
     Only the two HIGH-CONFIDENCE shapes are claimed here:
     - Exactly two IDENTICAL numbers, common for procedures with no lab
@@ -1439,7 +1474,8 @@ def extract_dd_codes_from_pdf_text(text: str, known_codes: set[str]) -> dict[str
         code = code_match.group(1)
         if code not in known_codes or code in results:
             continue
-        numbers = [float(n.replace(",", "")) for n in _DD_PDF_NUMBER_RE.findall(line[code_match.end():])]
+        segment = line[code_match.end():]
+        numbers = [float(n.replace(",", "")) for n in _DD_PDF_NUMBER_RE.findall(segment)]
         if not numbers:
             continue
         if len(numbers) == 2 and numbers[0] == numbers[1]:
@@ -1453,14 +1489,94 @@ def extract_dd_codes_from_pdf_text(text: str, known_codes: set[str]) -> dict[str
             # unclaimed rather than guessing, so it falls through to the
             # generic single-fee fallback (load_pt_fees_from_files) in
             # load_pt_dd_fees_from_files instead.
-        # else (exactly one number): also not confident enough to claim here
-        # -- same fallthrough to the generic fallback. Both of these
-        # low-confidence branches used to record a bare {"total": ...} guess
-        # directly, which was fine for NB (the guide this scanner was built
-        # and tested against) but wrongly intercepted codes on other
-        # provinces' DD PDFs (e.g. PE) that the older, more robust generic
-        # fallback already resolved correctly -- causing a regression when
-        # this tier was made to run on every DD PDF, not just NB's.
+        else:
+            # Neither of the two shapes above matched (e.g. two *unequal*
+            # numbers -- a decimal-matching Prof and a decimal-matching
+            # Total, with an in-between Lab value that didn't parse as a
+            # number at all because it's marked "+L", a variable additional
+            # lab charge rather than a fixed figure -- see
+            # _DD_VARIABLE_LAB_RE). Only Prof, the one unambiguous fixed
+            # number right after the code, is claimed in that case; Lab and
+            # Total are genuinely variable here, not just unresolved, so
+            # they're correctly left unset rather than guessed at.
+            var_lab_match = _DD_VARIABLE_LAB_RE.match(segment.lstrip())
+            if var_lab_match:
+                results[code] = {"prof": float(var_lab_match.group(1))}
+            # else: not confident enough to claim here -- same fallthrough
+            # to the generic fallback. These low-confidence branches used
+            # to record a bare {"total": ...} guess directly, which was
+            # fine for NB (the guide this scanner was built and tested
+            # against) but wrongly intercepted codes on other provinces' DD
+            # PDFs (e.g. PE) that the older, more robust generic fallback
+            # already resolved correctly -- causing a regression when this
+            # tier was made to run on every DD PDF, not just NB's.
+    return results
+
+
+def extract_dd_codes_from_headerless_docx_tables(tables, known_codes: set[str]) -> dict[str, dict[str, float]]:
+    """DD-specific scanner for docx tables with *no* header row at all (seen
+    throughout AB's DD guide: it's a long series of small per-section
+    tables, most un-headered, each consistently shaped
+    code / description / Prof / Lab / Total -- e.g. ['31310', 'Complete
+    Maxillary - Standard', '1032.00', '673.00', '1705.00']). Without a
+    header, extract_dd_codes_from_rows' role-column detection has nothing to
+    go on and skips these tables entirely.
+
+    Since the shape is consistent within a table -- code, then description,
+    then purely positional Prof/Lab/Total-shaped values -- this reads the
+    cells after the description the same way extract_dd_codes_from_lines
+    reads numbers off a text line: two equal values -> Total with Lab
+    forced to 0; three values satisfying Prof + Lab == Total -> the full
+    triple; anything else falls back to the single highest-confidence value
+    (the first real number found) recorded as Total alone, letting
+    resolve_dd_role_values's "one known value stands for both Prof and
+    Total" convention apply -- a genuine table row (not free-flowing prose)
+    is inherently higher-confidence than a text-line match, so this is
+    deliberately less conservative than extract_dd_codes_from_lines about
+    claiming the single- or mismatched-value cases rather than leaving them
+    for a later, worse fallback.
+
+    A row whose candidate cells are no-fixed-fee markers ("B.R." for AB,
+    same idea as "I.C."/"c.s." elsewhere -- see _NO_FEE_MARKER_RE) with no
+    real number at all resolves to that marker text instead of a number,
+    same convention as everywhere else in this project (see _marker_text).
+    """
+    results: dict[str, dict[str, float | str]] = {}
+    for header, rows in tables:
+        if header:
+            continue
+        for row in rows:
+            cells = list(row)
+            if len(cells) < 3:
+                continue
+            code = normalize_code(cells[0])
+            if code is None or code not in known_codes or code in results:
+                continue
+            candidates = cells[2:]
+            values: list[float | None] = []
+            marker_text = None
+            for cell in candidates:
+                text = str(cell).strip() if cell is not None else ""
+                if _NO_FEE_MARKER_RE.match(text):
+                    marker_text = marker_text or text
+                    values.append(None)
+                    continue
+                values.append(extract_max_dollar(cell))
+            real = [v for v in values if v is not None]
+            if not real:
+                if marker_text is not None:
+                    results[code] = {"prof": marker_text}
+                continue
+            if len(real) == 2 and real[0] == real[1]:
+                results[code] = {"prof": real[0], "lab": 0.0, "total": real[0]}
+            elif len(values) >= 3 and all(v is not None for v in values[:3]):
+                prof, lab, total = values[0], values[1], values[2]
+                if abs((prof + lab) - total) < 0.01:
+                    results[code] = {"prof": prof, "lab": lab, "total": total}
+                else:
+                    results[code] = {"total": real[0]}
+            else:
+                results[code] = {"total": real[0]}
     return results
 
 
@@ -1520,8 +1636,48 @@ def load_pt_dd_fees_from_files(files: list[Path], known_codes: set[str], verbose
             role_fees.update(new_fees)
             sources_used.append((f.name, len(new_fees)))
 
+    # The rest of AB's per-section tables have no header row at all (see
+    # extract_dd_codes_from_headerless_docx_tables) -- tried next, still
+    # ahead of the generic single-fee fallback, so those sections don't
+    # lose their Prof/Lab breakdown just because they're un-headered.
+    for f in (f for f in files if f.suffix.lower() in DOC_SUFFIXES):
+        remaining = known_codes - role_fees.keys()
+        if not remaining:
+            break
+        try:
+            new_fees = extract_dd_codes_from_headerless_docx_tables(tables_from_docx(f), remaining)
+        except Exception as e:
+            if verbose:
+                print(f"    WARNING: failed to read {f.name} as headerless tables: {e}")
+            continue
+        if new_fees:
+            role_fees.update(new_fees)
+            sources_used.append((f"{f.name} (headerless tables)", len(new_fees)))
+
+    # Some docx guides (e.g. PE's) have no real Word table for their fee
+    # data at all -- it's plain paragraphs with tab-separated values, which
+    # the table-based pass above (tables_from_docx) can't see. Tried on
+    # paragraph text the same way as PDF layout text (see
+    # extract_dd_codes_from_lines) so those guides don't lose their
+    # Prof/Lab breakdown down to Total-only (or worse, have their generic
+    # single-fee fallback's Total value wrongly stand in as Prof too --
+    # see load_pt_fees_from_files below) just because there's no table.
+    for f in (f for f in files if f.suffix.lower() in DOC_SUFFIXES):
+        remaining = known_codes - role_fees.keys()
+        if not remaining:
+            break
+        try:
+            new_fees = extract_dd_codes_from_lines(docx_paragraph_text(f), remaining)
+        except Exception as e:
+            if verbose:
+                print(f"    WARNING: failed to read {f.name} as paragraph text: {e}")
+            continue
+        if new_fees:
+            role_fees.update(new_fees)
+            sources_used.append((f"{f.name} (paragraph text)", len(new_fees)))
+
     # PDFs whose rows carry Prof/Lab/Total on the same line as the code
-    # (see extract_dd_codes_from_pdf_text) -- tried before the generic
+    # (see extract_dd_codes_from_lines) -- tried before the generic
     # single-fee fallback below so a PDF source doesn't lose its Prof/Lab
     # breakdown down to Total-only just because it isn't a spreadsheet/docx.
     for f in (f for f in files if f.suffix.lower() in PDF_SUFFIXES):
@@ -1533,7 +1689,7 @@ def load_pt_dd_fees_from_files(files: list[Path], known_codes: set[str], verbose
             layout_text = "\n".join(
                 page.extract_text(extraction_mode="layout") or "" for page in reader.pages
             )
-            new_fees = extract_dd_codes_from_pdf_text(layout_text, remaining)
+            new_fees = extract_dd_codes_from_lines(layout_text, remaining)
         except Exception as e:
             if verbose:
                 print(f"    WARNING: failed to read {f.name}: {e}")
