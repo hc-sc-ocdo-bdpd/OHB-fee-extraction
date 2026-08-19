@@ -21,6 +21,9 @@ import openpyxl
 import pypdf
 import xlrd
 from docx import Document
+from docx.oxml.ns import qn
+from docx.table import Table as _DocxTable
+from docx.text.paragraph import Paragraph as _DocxParagraph
 
 _DOLLAR_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
@@ -552,10 +555,123 @@ def tables_from_csv(path: Path):
         yield None, all_rows
 
 
+_MC_FALLBACK_TAG = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+
+
+def _in_mc_fallback(element) -> bool:
+    """True if `element` is nested inside a <mc:Fallback> branch.
+
+    Word represents each floating text box (or other AlternateContent-eligible
+    shape) TWICE in the raw XML: once as a modern DrawingML <mc:Choice> and
+    once as a legacy VML <mc:Fallback> -- both branches hold an identical
+    copy of the same content (tables, paragraphs). A raw XML search for every
+    <w:tbl>/<w:p> that doesn't account for this silently double-counts every
+    text box's content. Confirmed against AB's DD guide: document.xml has 178
+    <mc:AlternateContent> blocks, each with one <w:tbl> in Choice and one
+    equal copy in Fallback -- explains both the doubled 88-vs-44 table count
+    and the "same Prof/Lab/Total triplet repeated 2-4 times" pattern seen
+    when reading paragraph text. Skipping the Fallback branch keeps exactly
+    one copy of each text box's content.
+    """
+    for ancestor in element.iterancestors():
+        if ancestor.tag == _MC_FALLBACK_TAG:
+            return True
+    return False
+
+
+def _dedupe_repeated_leading_cell(row: list) -> list:
+    """Collapse a run of cells at the START of a row that are all an exact
+    duplicate of the first cell. Seen throughout AB's DD guide's text-box
+    tables: a horizontally-merged code/description/fee cell (e.g.
+    "41611\\tPartial Maxillary...\\t915.00") surfaces from python-docx as
+    2-3 separate cells all reporting that SAME merged text, followed by the
+    row's remaining genuine cells (Lab, Total). Left alone this misaligns
+    every downstream positional read; collapsing the repeat back to one
+    cell restores the intended code/description/prof/lab/total shape.
+    Deliberately scoped to a repeat of cell[0] specifically (not a blanket
+    adjacent-duplicate collapse across the whole row), since Prof and Lab
+    can legitimately be equal for a real procedure."""
+    if len(row) < 2:
+        return row
+    first = row[0]
+    i = 1
+    while i < len(row) and row[i] == first:
+        i += 1
+    return [first] + row[i:]
+
+
+def _flatten_tab_cells(row: list) -> list:
+    """Split any cell containing literal tab characters into separate
+    cells. Seen in AB's DD guide: a merged cell can hold "code\\t
+    description\\tfee" (or just "code\\tdescription") as one tab-joined
+    string rather than the description/fee living in their own table
+    cells -- e.g. "32510\\tComplete Maxillary - Reline...\\t586.00" next to
+    separate Lab/Total cells. Splitting it out restores a normal
+    code/description/prof/lab/total cell sequence."""
+    out = []
+    for cell in row:
+        if isinstance(cell, str) and "\t" in cell:
+            out.extend(part.strip() for part in cell.split("\t"))
+        else:
+            out.append(cell)
+    return out
+
+
+def _expand_stacked_row(row: list) -> list[list]:
+    """A row whose cells each hold 2+ values joined by a blank line
+    ("\\n\\n") represents multiple codes' worth of data horizontally
+    squeezed into one physical table row -- seen in AB's DD guide, e.g. a
+    code cell "31511\\n\\n31520" beside fee cells "732.00\\n\\n732.00" /
+    "328.00\\n\\n328.00" / "1060.00\\n\\n1060.00" (two codes sharing one
+    fee). Only expands when a candidate cell splits into the SAME count as
+    the first (code) cell, so a cell that merely has an incidentally
+    blank-line-separated description doesn't force a bogus split -- such a
+    cell is instead broadcast unchanged to every expanded row."""
+    if not row or not isinstance(row[0], str) or "\n\n" not in row[0]:
+        return [row]
+    code_parts = [p.strip() for p in row[0].split("\n\n")]
+    n = len(code_parts)
+    expanded_cells = [code_parts]
+    for cell in row[1:]:
+        if isinstance(cell, str) and "\n\n" in cell:
+            parts = [p.strip() for p in cell.split("\n\n")]
+            if len(parts) == n:
+                expanded_cells.append(parts)
+                continue
+        expanded_cells.append([cell] * n)
+    return [list(vals) for vals in zip(*expanded_cells)]
+
+
+def _normalize_docx_rows(raw_rows: list[list]) -> list[list]:
+    rows = []
+    for row in raw_rows:
+        row = _dedupe_repeated_leading_cell(row)
+        row = _flatten_tab_cells(row)
+        rows.extend(_expand_stacked_row(row))
+    return rows
+
+
 def tables_from_docx(path: Path):
     doc = Document(str(path))
-    for table in doc.tables:
-        rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+    # Document.tables only returns tables that are *direct* children of the
+    # document body -- a table nested inside another table's cell, or (seen
+    # in AB's DD guide) inside a floating text box (<w:txbxContent>, which
+    # isn't part of python-docx's Cell/Table object model at all), is
+    # invisible to it. Searching the raw XML tree for every <w:tbl> element
+    # regardless of where it's nested finds all of them: confirmed against
+    # AB's guide, whose document.xml has 88 <w:tbl> elements total, only 22
+    # of which doc.tables ever surfaced -- the other 66, in text boxes,
+    # held real fee rows (e.g. code 10010) that were silently never even
+    # considered for extraction. Each raw element is wrapped back into a
+    # normal python-docx Table (its rows/cells API needs a parent, but
+    # doesn't otherwise care that the element came from a text box) via the
+    # same constructor Document.tables itself uses internally.
+    for tbl_element in doc.element.body.findall(".//" + qn("w:tbl")):
+        if _in_mc_fallback(tbl_element):
+            continue
+        table = _DocxTable(tbl_element, doc)
+        raw_rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+        rows = _normalize_docx_rows(raw_rows)
         if not rows:
             continue
         if _looks_like_header(rows[0]):
@@ -566,7 +682,19 @@ def tables_from_docx(path: Path):
 
 def docx_paragraph_text(path: Path) -> str:
     doc = Document(str(path))
-    return "\n".join(p.text for p in doc.paragraphs)
+    # Document.paragraphs, like Document.tables (see tables_from_docx), only
+    # returns *direct* children of the document body -- paragraphs inside a
+    # floating text box are invisible to it. Confirmed against AB's DD
+    # guide: it has 3691 <w:p> elements total but doc.paragraphs only
+    # surfaces 878 of them -- the missing ones, in text boxes, hold real
+    # fee data (a code and its Prof/Lab/Total figures, each as its own
+    # paragraph/"line") that would otherwise silently vanish.
+    paragraphs = (
+        _DocxParagraph(p, doc)
+        for p in doc.element.body.findall(".//" + qn("w:p"))
+        if not _in_mc_fallback(p)
+    )
+    return "\n".join(p.text for p in paragraphs)
 
 
 def _parse_french_amount(text: str) -> float | None:
@@ -1425,6 +1553,15 @@ _DD_PDF_NUMBER_RE = re.compile(r"\d[\d,]*\.\d{2}")
 # number on the line) is claimed.
 _DD_VARIABLE_LAB_RE = re.compile(r"(\d[\d,]*\.\d{2})\s*[\t ]*\d[\d,]*\s*\+\s*L\b")
 
+# Same no-fixed-fee markers as _NO_FEE_MARKER_RE, but usable with findall
+# against a whole text line instead of only an exact, whole-cell match --
+# _NO_FEE_MARKER_RE is anchored (^...$) for that reason and can't find a
+# marker embedded partway through a longer line of description text. "lab
+# fee" is deliberately left out of this alternation (unlike
+# _NO_FEE_MARKER_RE's): free-flowing description text can genuinely contain
+# the word "Lab" (e.g. "Lab Processed") without meaning the marker.
+_DD_LINE_MARKER_RE = re.compile(r"\b(?:I\.?\s*C\.?|c\.?\s*s\.?|s\.?\s*c\.?|B\.?\s*R\.?)\.?\b", re.IGNORECASE)
+
 
 def extract_dd_codes_from_lines(text: str, known_codes: set[str]) -> dict[str, dict[str, float]]:
     """DD-specific line scanner for guides that print a code's Prof/Lab/Total
@@ -1477,18 +1614,48 @@ def extract_dd_codes_from_lines(text: str, known_codes: set[str]) -> dict[str, d
         segment = line[code_match.end():]
         numbers = [float(n.replace(",", "")) for n in _DD_PDF_NUMBER_RE.findall(segment)]
         if not numbers:
+            # No numbers at all -- but a no-fixed-fee marker ("S.C.", "I.C.",
+            # "B.R.", ...) can appear on the line instead, printed twice the
+            # same way a shared fee is (see the 2-identical-numbers case
+            # below): NB's guide prints "S.C." once for Clinical/Total each,
+            # e.g. "73008 ... S.C. S.C.". Only claimed when both occurrences
+            # match (after normalizing spacing/case) -- one lone marker
+            # occurrence is left for the generic fallback, same as before.
+            marker_matches = _DD_LINE_MARKER_RE.findall(segment)
+            if len(marker_matches) == 2:
+                norm = [re.sub(r"\s+", "", m).upper() for m in marker_matches]
+                if norm[0] == norm[1]:
+                    marker_text = marker_matches[0].strip()
+                    results[code] = {"prof": marker_text, "lab": marker_text, "total": marker_text}
             continue
         if len(numbers) == 2 and numbers[0] == numbers[1]:
-            results[code] = {"prof": numbers[0], "lab": 0.0, "total": numbers[0]}
+            # Two identical numbers with no third (Total) token on the line
+            # -- NB's guide's own "CLINICAL FEE / LABORATORY / TOTAL FEE"
+            # header names 3 roles, but for a procedure with no separate lab
+            # step it only ever prints the shared figure once more (Clinical
+            # and Total), not three times. Confirmed against NB's own
+            # ground-truth reference: Internal Lab Fee for these codes
+            # mirrors Prof/Total (e.g. code 70150 = 73/73/73), not 0 -- see
+            # resolve_dd_role_values for why mirroring Lab into Prof here
+            # doesn't double-count Total.
+            results[code] = {"prof": numbers[0], "lab": numbers[0], "total": numbers[0]}
         elif len(numbers) >= 3:
             prof, lab, total = numbers[0], numbers[1], numbers[-1]
-            if abs((prof + lab) - total) < 0.01:
+            # A small (<= $1) mismatch is a source-side rounding slip, not a
+            # sign this triple is misread -- confirmed against PE's DD
+            # guide: of 6 lines whose 3 numbers don't satisfy prof+lab=total
+            # exactly, 5 are off by precisely $1.00 (e.g. 953.00 + 468.00 =
+            # 1421.00 but the guide's own Total column reads 1420.00) while
+            # the 1 genuinely-wrong line is off by $131 -- comfortably far
+            # outside this tolerance, so it's still correctly left unclaimed.
+            if abs((prof + lab) - total) <= 1.00:
                 results[code] = {"prof": prof, "lab": lab, "total": total}
-            # else: numbers on the line don't satisfy prof+lab=total, so this
-            # isn't confidently a Prof/Lab/Total triple -- leave the code
-            # unclaimed rather than guessing, so it falls through to the
-            # generic single-fee fallback (load_pt_fees_from_files) in
-            # load_pt_dd_fees_from_files instead.
+            # else: numbers on the line don't satisfy prof+lab=total even
+            # loosely, so this isn't confidently a Prof/Lab/Total triple --
+            # leave the code unclaimed rather than guessing, so it falls
+            # through to the generic single-fee fallback
+            # (load_pt_fees_from_files) in load_pt_dd_fees_from_files
+            # instead.
         else:
             # Neither of the two shapes above matched (e.g. two *unequal*
             # numbers -- a decimal-matching Prof and a decimal-matching
@@ -1543,7 +1710,16 @@ def extract_dd_codes_from_headerless_docx_tables(tables, known_codes: set[str]) 
     """
     results: dict[str, dict[str, float | str]] = {}
     for header, rows in tables:
-        if header:
+        # Skip only a *genuine* Prof/Lab/Total role header -- tables_from_docx's
+        # _looks_like_header is a generic heuristic (several short,
+        # densely-packed cells) that can misfire on a stray, mostly-blank
+        # continuation row from the previous table's layout (seen in AB's
+        # guide: a header of ['', 'of one clasps', '', '', '']) and yield it
+        # as this table's "header" -- skipping every such table here would
+        # wrongly hand it to extract_dd_codes_from_rows instead, which would
+        # then use whatever role mapping happened to carry forward from an
+        # earlier, unrelated table rather than reading this row positionally.
+        if header and _looks_like_dd_role_header(header):
             continue
         for row in rows:
             cells = list(row)
@@ -1617,29 +1793,21 @@ def load_pt_dd_fees_from_files(files: list[Path], known_codes: set[str], verbose
             role_fees.update(new_fees)
             sources_used.append((f.name, len(new_fees)))
 
-    # Some docx guides (e.g. AB's) are a long series of small per-section
-    # tables, most with no header row of their own, but a handful do repeat
-    # a "DAC CODE / PROFESSIONAL FEE / LAB FEE / TOTAL FEE" header -- those
-    # sections' Prof/Lab/Total can still be resolved from labels the same
-    # way as a spreadsheet's.
-    for f in (f for f in files if f.suffix.lower() in DOC_SUFFIXES):
-        remaining = known_codes - role_fees.keys()
-        if not remaining:
-            break
-        try:
-            new_fees = extract_dd_codes_from_rows(tables_from_docx(f), remaining)
-        except Exception as e:
-            if verbose:
-                print(f"    WARNING: failed to read {f.name}: {e}")
-            continue
-        if new_fees:
-            role_fees.update(new_fees)
-            sources_used.append((f.name, len(new_fees)))
-
-    # The rest of AB's per-section tables have no header row at all (see
-    # extract_dd_codes_from_headerless_docx_tables) -- tried next, still
-    # ahead of the generic single-fee fallback, so those sections don't
-    # lose their Prof/Lab breakdown just because they're un-headered.
+    # AB's docx (and likely others of the same shape) is a long series of
+    # small per-section tables, most with no header row of their own. Tried
+    # first, ahead of the header-based pass below: extract_dd_codes_from_rows
+    # deliberately *carries forward* the last real role header it saw across
+    # tables that don't repeat one of their own (some docx guides genuinely
+    # are one consistent layout split into many small un-headered tables --
+    # see that function's docstring), which is exactly wrong once a docx has
+    # dozens of un-headered tables that DON'T all share one layout (seen
+    # once tables_from_docx started finding tables nested in text boxes,
+    # AB's guide went from 22 top-level tables to 88 total) -- a stale
+    # carried-over column mapping from an unrelated earlier table then
+    # misreads a later table's own Code column as if it were Prof. This
+    # tier never looks past the row it's on, so it can't be confused that
+    # way; only tables it can't confidently resolve on their own are left
+    # for the header-based/carry-forward pass afterward.
     for f in (f for f in files if f.suffix.lower() in DOC_SUFFIXES):
         remaining = known_codes - role_fees.keys()
         if not remaining:
@@ -1653,6 +1821,24 @@ def load_pt_dd_fees_from_files(files: list[Path], known_codes: set[str], verbose
         if new_fees:
             role_fees.update(new_fees)
             sources_used.append((f"{f.name} (headerless tables)", len(new_fees)))
+
+    # Whatever's left, including sections that genuinely do repeat a
+    # "DAC CODE / PROFESSIONAL FEE / LAB FEE / TOTAL FEE" header (or share a
+    # consistent layout with one, per the carry-forward behavior described
+    # above), resolved the same way as a spreadsheet's labeled columns.
+    for f in (f for f in files if f.suffix.lower() in DOC_SUFFIXES):
+        remaining = known_codes - role_fees.keys()
+        if not remaining:
+            break
+        try:
+            new_fees = extract_dd_codes_from_rows(tables_from_docx(f), remaining)
+        except Exception as e:
+            if verbose:
+                print(f"    WARNING: failed to read {f.name}: {e}")
+            continue
+        if new_fees:
+            role_fees.update(new_fees)
+            sources_used.append((f.name, len(new_fees)))
 
     # Some docx guides (e.g. PE's) have no real Word table for their fee
     # data at all -- it's plain paragraphs with tab-separated values, which
@@ -1731,11 +1917,20 @@ def resolve_dd_role_values(values: dict[str, float]) -> tuple[float | None, floa
     Lab at all (just a single fallback 'total' value) -- that value is
     treated as the Prof fee too, matching this project's original
     single-value DD behavior for sources without labeled columns.
+
+    The one exception to the recompute: when Prof and Lab arrive already
+    EQUAL, they're not two independent additive amounts -- that shape only
+    ever comes from extract_dd_codes_from_lines's own "exactly one value,
+    printed once, mirrored into both roles" case (see there), where the
+    source line structurally never had a separate (2x) Total token to
+    begin with. Summing them there would silently double an already-correct
+    Total (confirmed against NB's DD guide, e.g. "70150 ... 73.00 73.00"
+    with no third number -- the real Total is 73, not 146).
     """
     prof = values.get("prof")
     lab = values.get("lab")
     total = values.get("total")
-    if prof is not None and lab is not None:
+    if prof is not None and lab is not None and prof != lab:
         total = prof + lab
     elif total is None:
         if prof is not None:
