@@ -1408,6 +1408,15 @@ def _looks_like_dd_role_header(row) -> bool:
     return len(_find_dd_role_column_candidates(row)) >= 2
 
 
+# A Lab cell containing only "+L" (optionally without the "+") -- ON's DD
+# guide's own no-fixed-lab-fee marker, distinct from the "prof+L" suffix
+# pattern PE's guide uses (see _DD_VARIABLE_LAB_RE/_DD_VARIABLE_LAB_TRIPLE_RE):
+# here the whole cell is nothing but the marker, with no number attached at
+# all. Canonicalized to "L" (dropping the "+") to match the reference sheet's
+# own convention for this marker.
+_LAB_VARIABLE_CELL_RE = re.compile(r"^\s*\+?\s*L\s*$", re.IGNORECASE)
+
+
 def extract_dd_codes_from_rows(tables, known_codes: set[str]) -> dict[str, dict[str, float]]:
     """DD-specific (code -> {'prof': .., 'lab': .., 'total': ..}) scanner.
     Like extract_codes_from_rows, but for sources with identifiable
@@ -1480,6 +1489,17 @@ def extract_dd_codes_from_rows(tables, known_codes: set[str]) -> dict[str, dict[
             total_candidates = [f for _, f in _role_cells("total") if f is not None]
             prof_candidates = [f for _, f in prof_cells if f is not None]
             lab_candidates = [f for _, f in lab_cells if f is not None]
+            # A Lab cell holding just "+L" (no attached number -- ON's DD
+            # guide's own way of flagging "this procedure's lab component is
+            # billed separately/variably") is real information, not a blank:
+            # kept as literal marker text "L", the same convention as
+            # I.C./c.s./S.C./B.R. elsewhere, rather than left unresolved.
+            lab_marker = None
+            if not lab_candidates:
+                for cell, _ in lab_cells:
+                    if isinstance(cell, str) and _LAB_VARIABLE_CELL_RE.match(cell):
+                        lab_marker = "L"
+                        break
             # A genuinely blank Prof or Lab cell (as opposed to a
             # non-numeric marker like "+L"/"SC" for a variable/
             # client-specific charge) means this procedure simply has no
@@ -1503,7 +1523,7 @@ def extract_dd_codes_from_rows(tables, known_codes: set[str]) -> dict[str, dict[
             # combination of candidates actually satisfies this row's own
             # Prof + Lab = Total, rather than guessing by position.
             prof = prof_candidates[-1] if prof_candidates else None
-            lab = lab_candidates[-1] if lab_candidates else None
+            lab = lab_candidates[-1] if lab_candidates else (lab_marker if lab_marker else None)
             total = total_candidates[-1] if total_candidates else None
             if len(prof_candidates) > 1 or len(lab_candidates) > 1 or len(total_candidates) > 1:
                 best = None
@@ -1552,6 +1572,18 @@ _DD_PDF_NUMBER_RE = re.compile(r"\d[\d,]*\.\d{2}")
 # here, not just unresolved, so only Prof (the one unambiguous, fixed
 # number on the line) is claimed.
 _DD_VARIABLE_LAB_RE = re.compile(r"(\d[\d,]*\.\d{2})\s*[\t ]*\d[\d,]*\s*\+\s*L\b")
+
+# The full Prof/Lab/Total triple when Lab and Total both carry the "+L"
+# marker -- confirmed against PE's DD guide across 18 such lines (e.g.
+# "1531.00   755+L   2286.00+L") that "+L" is a footnote annotation ("this
+# procedure may incur an additional lab charge"), not a sign the printed
+# figures themselves are unknown: every one of the 18 satisfies
+# Prof + Lab == Total exactly once "+L" is stripped (1531 + 755 = 2286).
+# Only claimed when that arithmetic holds; otherwise falls through to
+# _DD_VARIABLE_LAB_RE's Prof-only claim below, same as before.
+_DD_VARIABLE_LAB_TRIPLE_RE = re.compile(
+    r"(\d[\d,]*\.\d{2})\s*[\t ]*(\d[\d,]*(?:\.\d{2})?)\s*\+\s*L\b\s*(\d[\d,]*\.\d{2})\s*\+\s*L\b"
+)
 
 # Same no-fixed-fee markers as _NO_FEE_MARKER_RE, but usable with findall
 # against a whole text line instead of only an exact, whole-cell match --
@@ -1659,16 +1691,27 @@ def extract_dd_codes_from_lines(text: str, known_codes: set[str]) -> dict[str, d
         else:
             # Neither of the two shapes above matched (e.g. two *unequal*
             # numbers -- a decimal-matching Prof and a decimal-matching
-            # Total, with an in-between Lab value that didn't parse as a
-            # number at all because it's marked "+L", a variable additional
-            # lab charge rather than a fixed figure -- see
-            # _DD_VARIABLE_LAB_RE). Only Prof, the one unambiguous fixed
-            # number right after the code, is claimed in that case; Lab and
-            # Total are genuinely variable here, not just unresolved, so
-            # they're correctly left unset rather than guessed at.
-            var_lab_match = _DD_VARIABLE_LAB_RE.match(segment.lstrip())
-            if var_lab_match:
-                results[code] = {"prof": float(var_lab_match.group(1))}
+            # Total, with an in-between Lab value marked "+L"). Try the full
+            # Prof/Lab/Total triple first (see _DD_VARIABLE_LAB_TRIPLE_RE):
+            # "+L" turns out to be a footnote annotation on real, fixed
+            # figures, not a sign they're unknown, but only trusted once
+            # Prof + Lab == Total confirms the numbers were read correctly.
+            # Falls back to claiming just Prof (the one unambiguous fixed
+            # number right after the code) when the triple doesn't parse or
+            # doesn't satisfy that check.
+            var_triple_match = _DD_VARIABLE_LAB_TRIPLE_RE.match(segment.lstrip())
+            if var_triple_match:
+                prof = float(var_triple_match.group(1).replace(",", ""))
+                lab = float(var_triple_match.group(2).replace(",", ""))
+                total = float(var_triple_match.group(3).replace(",", ""))
+                if abs((prof + lab) - total) < 0.01:
+                    results[code] = {"prof": prof, "lab": lab, "total": total}
+                else:
+                    results[code] = {"prof": prof}
+            else:
+                var_lab_match = _DD_VARIABLE_LAB_RE.match(segment.lstrip())
+                if var_lab_match:
+                    results[code] = {"prof": float(var_lab_match.group(1))}
             # else: not confident enough to claim here -- same fallthrough
             # to the generic fallback. These low-confidence branches used
             # to record a bare {"total": ...} guess directly, which was
@@ -1744,13 +1787,31 @@ def extract_dd_codes_from_headerless_docx_tables(tables, known_codes: set[str]) 
                     results[code] = {"prof": marker_text}
                 continue
             if len(real) == 2 and real[0] == real[1]:
-                results[code] = {"prof": real[0], "lab": 0.0, "total": real[0]}
+                # Two identical figures with no distinguishable 3rd (Total)
+                # cell -- same shape and same fix as
+                # extract_dd_codes_from_lines' 2-identical-numbers case (see
+                # there, and resolve_dd_role_values for why mirroring into
+                # Lab instead of forcing 0 doesn't double-count Total):
+                # confirmed against AB's own "CLINICAL FEE / LABORATORY /
+                # TOTAL FEE" table rows for codes with no separate lab step
+                # (e.g. 71010 = 85/85/85, not 85/0/85).
+                results[code] = {"prof": real[0], "lab": real[0], "total": real[0]}
             elif len(values) >= 3 and all(v is not None for v in values[:3]):
                 prof, lab, total = values[0], values[1], values[2]
                 if abs((prof + lab) - total) < 0.01:
                     results[code] = {"prof": prof, "lab": lab, "total": total}
                 else:
-                    results[code] = {"total": real[0]}
+                    # The row's own printed 3rd (Total) number doesn't
+                    # satisfy Prof + Lab -- confirmed against AB's DD guide
+                    # to be a source-side typo in that 3rd number alone
+                    # (e.g. code 41711: printed Total 613.00, but Prof
+                    # 420.00 + Lab 211.00 = 631.00, matching the reference
+                    # exactly), not a sign Prof/Lab themselves are
+                    # misaligned. Positions 0/1 are still claimed as
+                    # Prof/Lab; the printed Total is dropped rather than
+                    # trusted, letting resolve_dd_role_values recompute it
+                    # as Prof + Lab instead.
+                    results[code] = {"prof": prof, "lab": lab}
             else:
                 results[code] = {"total": real[0]}
     return results
@@ -1884,9 +1945,26 @@ def load_pt_dd_fees_from_files(files: list[Path], known_codes: set[str], verbose
             role_fees.update(new_fees)
             sources_used.append((f"{f.name} (pdf rows)", len(new_fees)))
 
+    # The final generic single-fee scanner (load_pt_fees_from_files) is
+    # deliberately NOT pointed at docx sources here: every DD-aware docx
+    # tier above (headerless tables, header-based rows, paragraph-line
+    # pairing) already had its shot at the SAME document, each requiring a
+    # code and its fee to be on the same row/line -- a much higher
+    # confidence bar than the generic scanner's. A code neither could
+    # resolve means the docx simply doesn't say, in any readable position,
+    # what that code's fee is (confirmed against AB's DD guide: several
+    # codes' fee numbers live in a *different* floating text-box shape than
+    # their code, with no reliable reading-order link between the two).
+    # Letting the generic scanner take one more, looser pass at that same
+    # document was pulling in a nearby-but-wrong number often enough to be
+    # worse than just leaving the code unresolved (N/A) -- confirmed
+    # against several codes users flagged as *wrong*, not merely missing.
+    # PDF/spreadsheet sources aren't affected: those never got a DD-aware
+    # docx tier's more careful attempt in the first place.
+    non_docx_files = [f for f in files if f.suffix.lower() not in DOC_SUFFIXES]
     missing = known_codes - role_fees.keys()
-    if missing:
-        single_fees, single_sources = load_pt_fees_from_files(files, missing, verbose)
+    if missing and non_docx_files:
+        single_fees, single_sources = load_pt_fees_from_files(non_docx_files, missing, verbose)
         for code, fee in single_fees.items():
             role_fees[code] = {"total": fee}
         sources_used.extend(single_sources)
@@ -1930,7 +2008,8 @@ def resolve_dd_role_values(values: dict[str, float]) -> tuple[float | None, floa
     prof = values.get("prof")
     lab = values.get("lab")
     total = values.get("total")
-    if prof is not None and lab is not None and prof != lab:
+    both_numeric = isinstance(prof, (int, float)) and isinstance(lab, (int, float))
+    if both_numeric and prof != lab:
         total = prof + lab
     elif total is None:
         if prof is not None:
