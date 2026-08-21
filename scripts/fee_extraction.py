@@ -119,6 +119,20 @@ def _marker_text(value: str) -> str:
     return value.strip()
 
 
+def _is_zero_padded_numeric_code(raw) -> bool:
+    """True if `raw` is a *number* that normalize_code would have to pad with
+    a leading zero to reach 5 digits (e.g. 2116 -> "02116"). Such a cell is
+    far more likely a fee than a procedure code: a code stored as text keeps
+    its leading zero ("02116"), so only genuinely 5-digit-valued numbers
+    (71209) read as codes without padding. See extract_codes_from_rows for
+    how this disambiguates a row that appears to hold two different codes."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return False
+    if isinstance(raw, float) and not raw.is_integer():
+        return False
+    return 0 <= int(raw) < 10000
+
+
 def extract_max_dollar(value) -> float | None:
     """Extract the largest dollar amount from a fee cell.
 
@@ -361,6 +375,36 @@ def extract_codes_from_rows(
                     code_cells.append((i, code))
             if not code_cells:
                 continue
+            # A numeric cell only reaching 5 digits via zero-padding (raw
+            # value under 10000, e.g. the number 2116 -> "02116") is
+            # ambiguous: it's usually this row's *fee*, coincidentally
+            # resembling some unrelated procedure code. When the row also
+            # holds a code that needed no padding, that unpadded one is the
+            # row's real code and the padded lookalikes are dropped --
+            # otherwise the row gets harvested a second time under the
+            # bogus code, with some other column standing in as its "fee".
+            # Confirmed against SK's SP guide, whose row for code 75303
+            # ("...2116") was being recorded as code 02116 priced at $25 --
+            # 25 being the row's numeric *specialty* column, the only other
+            # number left once the real code and the fee were excluded.
+            # Rows where EVERY code-shaped cell is padded are left alone: a
+            # source legitimately storing "01011" as the number 1011 in its
+            # code column has no unpadded alternative to prefer. The
+            # unpadded alternative is looked for across the whole row, not
+            # just among code_cells, since the row's real code is often one
+            # this particular call isn't even asking about (75303 above is
+            # not in `known_codes` when only 02116 was requested).
+            if any(not _is_zero_padded_numeric_code(cells[i]) for i, _ in code_cells):
+                code_cells = [(i, c) for i, c in code_cells
+                              if not _is_zero_padded_numeric_code(cells[i])]
+            elif any(
+                normalize_code(cell) is not None and not _is_zero_padded_numeric_code(cell)
+                for j, cell in enumerate(cells)
+                if candidate_code_col_indices is None or j in candidate_code_col_indices
+            ):
+                code_cells = []
+            if not code_cells:
+                continue
             # Exclude every cell that restates *this same* code elsewhere in
             # the row (e.g. a truncated numeric id "1011" alongside the full
             # code "01011") -- but NOT cells that happen to match a
@@ -429,16 +473,38 @@ def extract_codes_from_rows(
                 fees[code] = exact[0]
             elif neutral:
                 fees[code] = neutral[0]
-            # Else: every row found for this code is labeled for some
-            # *other*, specific specialty/context (e.g. only a "GP" and an
-            # "LTC" row exist, but the code was asked for as "PA") -- rather
-            # than guess by picking whichever happened to come last, leave
-            # it unmatched. This is the same situation load_pt_fees_by_
-            # subspecialty's GP-fallback is meant to handle (deliberately
-            # triggered only when a whole sub-specialty gets zero matches,
-            # not per missing code -- see its docstring), so silently
-            # substituting a wrong-context value here would both produce an
-            # incorrect fee and mask that fallback from ever running.
+            else:
+                # No row for the requested specialty, and none unlabeled.
+                # A row this same guide labels "GP" is the right last
+                # resort: a combined GP+SP guide prices a procedure once
+                # under GP and adds specialist rows only for the
+                # specialties that bill it at a premium, so a specialist
+                # performing a procedure with no premium row of its own
+                # bills the guide's own general rate. Confirmed against
+                # PE's combined guide: every flagged case where NO row
+                # matched the requested specialty (e.g. 02101 asked as OS
+                # or PE, 21221 as EN or PR, 41211 as OM or OP) has the
+                # guide's GP fee as its reference value.
+                #
+                # Deliberately GP specifically, never "any other label":
+                # picking whichever row happened to come last is what this
+                # branch used to (correctly) refuse to do, and the other
+                # labels really are wrong-context -- PE's guide also
+                # carries "LTC" (long-term-care premium) rows for several
+                # of these same codes (21221 at $240.50 vs GP's $185), and
+                # a *different* specialty's premium row is wronger still
+                # (41211 was resolving to the "PER" row's $140.40 when
+                # asked for OM/OP, against a reference value of $84).
+                #
+                # Ranked below `neutral` as well, so a guide with genuinely
+                # unlabeled rows keeps using those first, exactly as before.
+                gp_rows = [f for label, f in candidates if label == "GP"]
+                if gp_rows:
+                    fees[code] = gp_rows[0]
+                # Else: nothing usable in this source -- still left
+                # unmatched rather than guessed at, so
+                # load_pt_fees_by_subspecialty's own GP-fallback (which
+                # reads the province's separate GP guide) can still run.
     return fees
 
 
@@ -894,10 +960,31 @@ _CROSS_REF_CUE_WORDS = {
     "of", "or", "and", "lieu", "than", "instead", "not",
     "et",  # French "and" -- QC guides list codes together in French prose
 }
-_PRECEDING_WORD_RE = re.compile(r"([A-Za-z]+)\s*$")
+# Deliberately "[ \t]*", not "\\s*": the cue word only counts when it sits on
+# the SAME line as the code. A real prose cross-reference reads inline ("as
+# per 00100", "see code 00616"), whereas a code that starts its own line is
+# beginning its own entry -- and a fee table's wrapped description lines
+# routinely end on one of these cue words purely by accident (confirmed in
+# SK's SP guide, where 71201's description wraps to "...Sectioning of Tooth
+# for Removal of" immediately above 71211's real entry). Letting "\\s*" reach
+# back across the newline excluded that genuine entry as a "cross-reference",
+# which in turn removed it as a segment boundary -- so the PREVIOUS code's
+# segment ran on through it and picked up its fee (code 71209 resolving to
+# 71211's $417 instead of its own $343).
+# Anchored with "\\Z", not "$": "$" also matches immediately BEFORE a final
+# newline, which would let the cue word be found across exactly the line
+# break this is meant to stop at.
+_PRECEDING_WORD_RE = re.compile(r"([A-Za-z]+)[ \t]*\Z")
 _FOLLOWING_WORD_RE = re.compile(r"^\s*([A-Za-z]+)")
 _FOLLOWED_BY_PERIOD_RE = re.compile(r"^\s?\.")
-_FOLLOWED_BY_RANGE_RE = re.compile(r"^\s*-")
+# "/" plus a digit is the other code-range shorthand these guides use, seen
+# in SK's SP guide listing a section's member codes as "(To include 73111,
+# 73141/42, 73151/54, 73161, 73171/72, 73181/84)" -- a pure cross-reference
+# list, but one where the "/84" tail also reads as a bare number, so the
+# codes in it were resolving to fees like $84 from that mention instead of
+# from their own real entries further down. Requires the digit so an
+# entry legitimately followed by a slash-delimited description isn't caught.
+_FOLLOWED_BY_RANGE_RE = re.compile(r"^\s*(?:-|/\d)")
 _FOLLOWED_BY_LIST_PUNCTUATION_RE = re.compile(r"^\s*[,)]")
 
 # Marks the start of a back-of-guide numeric index (code -> page number),
@@ -1189,7 +1276,15 @@ def discover_pt_files(specialty_dir: Path, province: str) -> list[Path]:
        vendor, not the province).
     """
     aliases = PROVINCE_ALIASES.get(province, [province])
-    patterns = [re.compile(rf"^{re.escape(a)}\b", re.IGNORECASE) for a in aliases]
+    # A trailing \b wouldn't reliably match here: \b only draws a boundary
+    # where a "word" character (regex \w, which includes "_") meets a
+    # non-word one, so "^ON\b" never matches "ON_PR_Fee_Guide_2026.xlsx" --
+    # this project's actual naming convention -- since "_" doesn't create
+    # one (see classify_file_specialty for the same underlying mistake,
+    # found via this exact symptom on ON's SP guides). A lookahead for "the
+    # next character isn't a letter/digit" (or end of string) reliably
+    # covers "_", "-", " ", "." alike.
+    patterns = [re.compile(rf"^{re.escape(a)}(?=[^A-Za-z0-9]|$)", re.IGNORECASE) for a in aliases]
 
     province_subdirs = [
         specialty_dir / alias for alias in aliases if (specialty_dir / alias).is_dir()
@@ -1207,8 +1302,13 @@ def discover_pt_files(specialty_dir: Path, province: str) -> list[Path]:
 
 
 def _is_english(path: Path) -> bool:
-    name = path.stem.upper()
-    return "FR" not in name.split() and "FRENCH" not in name and "- FR" not in name.upper()
+    # str.split() only splits on whitespace -- against this project's
+    # actual underscore-separated filenames (e.g. "QC_DH_Fee_Guide_FR"),
+    # "FR" is never its own whitespace-delimited token, so the check below
+    # would silently never fire without normalizing "_"/"-" to spaces
+    # first (see classify_file_specialty for the same underlying issue).
+    name = path.stem.upper().replace("_", " ").replace("-", " ")
+    return "FR" not in name.split() and "FRENCH" not in name
 
 
 def load_pt_fees_from_files(
@@ -2139,8 +2239,19 @@ def classify_file_specialty(path: Path, province: str | None = None) -> set[str]
     "PE GP SP LTC Fee Guide" (Prince Edward Island's combined guide) gets
     misread as Periodontics-specific, since "PE" is coincidentally both the
     province's abbreviation and the Periodontics specialty marker.
+
+    Underscores and hyphens are normalized to spaces before any \\b-anchored
+    matching below: \\b only draws a boundary where a "word" character
+    (regex \\w, which includes "_") meets a non-word one, so "_" never
+    creates one on its own -- \\bPR\\b silently never matches inside
+    "ON_PR_FEE_GUIDE_2026", the actual naming convention this project's own
+    PT fee guide files use (confirmed: every ON SP guide -- PA, PE, PR, OS,
+    EN -- classified as unspecific/general under the un-normalized version,
+    which fed them all into the same "no dedicated file" fallback pool
+    regardless of which specialty they actually named, corrupting SP
+    fee resolution for any code shared across specialties).
     """
-    name = path.stem.upper()
+    name = path.stem.upper().replace("_", " ").replace("-", " ")
     if province:
         for alias in PROVINCE_ALIASES.get(province, [province]):
             m = re.match(rf"^{re.escape(alias)}\b\s*", name, re.IGNORECASE)
@@ -2170,7 +2281,10 @@ _COMBINED_GUIDE_MARKERS = ["GP", "SP"]
 
 
 def _is_context_restricted(path: Path) -> bool:
-    name = path.stem.upper()
+    # See classify_file_specialty for why "_"/"-" must be normalized to
+    # spaces before \b-anchored matching against this project's actual
+    # underscore-separated filenames.
+    name = path.stem.upper().replace("_", " ").replace("-", " ")
     has_restricted_marker = any(re.search(rf"\b{marker}\b", name) for marker in _CONTEXT_RESTRICTED_MARKERS)
     if not has_restricted_marker:
         return False
