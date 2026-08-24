@@ -2149,7 +2149,13 @@ SUBSPECIALTY_FILE_MARKERS: dict[str, list[str]] = {
     "OP": ["OP", "ORAL PATHOLOGY"],
     "OR": ["OR", "ORT", "ORTHODONTIC", "ORTHODONTICS"],
     "RA": ["RA", "RADIOLOGY"],
-    "AN": ["AN", "ANESTHESIA", "ANESTHESIOLOGY"],
+    # "DA" (Dental Anaesthesia) is Ontario's name for this guide. Without it
+    # ON_DA_Fee_Guide_2026.xlsx classifies as *unspecific* and so becomes the
+    # general fallback consulted for every other sub-specialty -- which is
+    # how OM/OP/RA codes were resolving to anaesthesia rates. Confirmed by
+    # the data: 54 flagged ON rows for CDCP specialty "AN" match that file's
+    # value exactly, and nothing else's.
+    "AN": ["AN", "DA", "ANESTHESIA", "ANESTHESIOLOGY", "DENTAL ANAESTHESIA"],
 }
 
 
@@ -2344,6 +2350,28 @@ def _multiplier_for_code(code: str, ranges: list[tuple[int, int, float]]) -> flo
     return None
 
 
+# Provinces where a code the sub-specialty's OWN guide doesn't list falls back
+# to the province's GP fee guide, per missing code rather than only when the
+# whole sub-specialty came up empty (see load_pt_fees_by_subspecialty's
+# docstring for why the all-or-nothing form is the default).
+#
+# This is the reference's own stated convention -- "For any SP code without SP
+# specific fee, GP fee is assumed" -- applied literally. Confirmed against
+# Ontario over 1115 flagged SP rows: 847 take the sub-specialty guide's own
+# value where that guide lists the code (so the guide must still win -- this
+# only ever fills gaps, never overrides), and 190 of the codes those guides
+# DON'T list match the ON GP guide's value exactly.
+#
+# Kept an explicit per-province opt-in rather than made global because the
+# default's caution is well-founded elsewhere: a sub-specialty with good
+# coverage and a few individually-unmatched codes is usually suffering an
+# extraction gap, and filling those from the GP guide would quietly replace
+# "N/A" with a plausible-looking wrong fee. Ontario is opted in because the
+# gap there is real (its specialty guides genuinely omit whole code ranges),
+# not an extraction artifact.
+SP_GP_GUIDE_FILLS_GAPS: set[str] = {"ON"}
+
+
 def load_pt_fees_by_subspecialty(
     specialty_dir: Path,
     province: str,
@@ -2396,12 +2424,43 @@ def load_pt_fees_by_subspecialty(
 
     fees: dict[tuple[str, str], float] = {}
     sources_used: list[tuple[str, int]] = []
+
+    # For a province listed in SP_GP_GUIDE_FILLS_GAPS, the GP guide answers
+    # any code the sub-specialty's own guide doesn't list (see that
+    # constant). Loaded once for every sub-specialty's codes together rather
+    # than per sub-specialty, since the same file answers all of them and
+    # re-reading it ~10 times is pure waste.
+    gp_gap_fees: dict[str, float | str] = {}
+    if province in SP_GP_GUIDE_FILLS_GAPS and gp_specialty_dir is not None:
+        all_codes = set().union(*codes_by_subspecialty.values()) if codes_by_subspecialty else set()
+        if all_codes:
+            gp_gap_fees, gp_gap_sources, _ = load_pt_fees(
+                gp_specialty_dir, province, all_codes, verbose=False
+            )
+            sources_used.extend(
+                (f"{name} (GP guide, filling SP gaps)", n) for name, n in gp_gap_sources
+            )
     for sub_specialty, codes in codes_by_subspecialty.items():
         specific_files = [f for f in files if sub_specialty in classify_file_specialty(f, province)]
         candidate_files = specific_files + general_files if specific_files else general_files
         sub_fees, sub_sources = load_pt_fees_from_files(
             candidate_files, codes, verbose, target_specialty=sub_specialty
         )
+        # Gap-fill only -- never overrides a real fee the sub-specialty's own
+        # guide supplied, which stays authoritative. A no-fixed-fee marker
+        # ("I.C." etc.) counts as a gap rather than a value here: the guide
+        # is saying it has no set price for that code, so the GP guide's
+        # actual number is better information than passing the marker
+        # through (ON's OS guide prices 04314/04315 as "I.C." where the
+        # reference carries the GP guide's 114 / 109).
+        if gp_gap_fees:
+            for c in codes:
+                existing = sub_fees.get(c)
+                is_gap = existing is None or (
+                    isinstance(existing, str) and _NO_FEE_MARKER_RE.match(existing.strip())
+                )
+                if is_gap and c in gp_gap_fees:
+                    sub_fees[c] = gp_gap_fees[c]
         for code, fee in sub_fees.items():
             fees[(code, sub_specialty)] = fee
         sources_used.extend(sub_sources)
