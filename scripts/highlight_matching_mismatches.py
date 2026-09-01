@@ -3,35 +3,80 @@ Copy the "green" highlight from the master Fee_Comparison_Mismatches workbook's
 Mismatches sheet onto the matching rows of another Fee_Comparison_Mismatches
 workbook (matched by Sheet/Field/PT/Specialty/Procedure Code).
 
+Which year's files are used comes from scripts/config.py (YEAR); nothing in
+this file needs editing to run a different year.
+
 Usage:
     python scripts/highlight_matching_mismatches.py [other.xlsx] [master.xlsx] [output.xlsx]
 
-If other.xlsx is omitted, defaults to OTHER_FILE_PATH below.
-If master.xlsx is omitted, defaults to MASTER_FILE_PATH below.
-If output.xlsx is omitted, the result is saved back to MASTER_FILE_PATH,
+If other.xlsx is omitted, defaults to that year's Fee_Comparison_Mismatches.xlsx.
+If master.xlsx is omitted, defaults to that year's Fee_Comparison_Mismatches_master.xlsx.
+If output.xlsx is omitted, the result is saved back over the master,
 replacing it -- the newly highlighted file becomes the new master.
 """
 
+import os
 import sys
 from pathlib import Path
 
 import openpyxl
 from openpyxl.styles import PatternFill
 
-MASTER_FILE_PATH = (
-    r"C:\Users\JOGILL\OneDrive - HC-SC PHAC-ASPC\Desktop\OHB\Data"
-    r"\Output_2026 Fee Comparison\Fee_Comparison_Mismatches_master.xlsx"
-)
-OTHER_FILE_PATH = (
-    r"C:\Users\JOGILL\OneDrive - HC-SC PHAC-ASPC\Desktop\OHB\Data"
-    r"\Output_2026 Fee Comparison\Fee_Comparison_Mismatches.xlsx"
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config
+
+# Both default paths follow config.YEAR -- change the year there, not here.
+# The row-matching logic itself is year-agnostic (rows are keyed on
+# Sheet/Field/PT/Specialty/Procedure Code, and the "Field" values embed the
+# year but both workbooks come from the same run, so they agree).
+MASTER_FILE_PATH = config.mismatch_master()
+OTHER_FILE_PATH = config.mismatch_report()
 
 SHEET_NAME = "Mismatches"
 # Key columns used to match a row across the two workbooks. "Ground Truth"
 # and "Generated" are deliberately excluded since "Generated" is exactly the
 # value expected to potentially differ between the two runs.
 KEY_COLUMNS = ["Sheet", "Field", "PT", "Specialty", "Procedure Code"]
+
+
+def _excel_lock_file(path: Path) -> Path:
+    """Where Excel puts its lock file while `path` is open ("~$name.xlsx")."""
+    return path.with_name("~$" + path.name)
+
+
+def _refuse_if_open_in_excel(path: Path) -> None:
+    """Stop before writing a workbook Excel currently has open.
+
+    Overwriting a file Excel is holding is how this script produced an
+    unopenable workbook: on Windows the write can land on a file Excel still
+    owns, and in a OneDrive/SharePoint-synced folder the sync client sees the
+    file change underneath it and resolves it as a *merge conflict* rather
+    than a clean update. Failing here with the reason is far better than
+    handing back a workbook that won't open."""
+    lock = _excel_lock_file(path)
+    if lock.exists():
+        raise SystemExit(
+            f"ERROR: {path.name} looks like it is open in Excel (found {lock.name}).\n"
+            f"  Close it and re-run -- writing over a workbook Excel still has open\n"
+            f"  corrupts it, and in a synced folder (OneDrive/SharePoint) it shows up\n"
+            f"  as a merge conflict the next time you open the file."
+        )
+
+
+def _save_atomically(wb, output_path: Path) -> None:
+    """Write the workbook to a temp file in the same folder, then move it into
+    place. A direct wb.save() onto the destination leaves a half-written file
+    if anything interrupts it (an exception, or a sync client uploading
+    mid-write), and a half-written .xlsx is exactly what Excel reports as
+    damaged. os.replace is atomic within one filesystem, so the destination is
+    either the old file or the complete new one, never a partial one."""
+    tmp = output_path.with_name(output_path.name + ".tmp")
+    try:
+        wb.save(tmp)
+        os.replace(tmp, output_path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def _is_green_highlight(cell) -> bool:
@@ -94,7 +139,7 @@ def apply_highlight(other_path: Path, keys: set, highlight_fill: PatternFill, ou
             for cell in row:
                 cell.fill = highlight_fill
 
-    wb.save(output_path)
+    _save_atomically(wb, output_path)
     wb.close()
     return matched
 
@@ -110,6 +155,16 @@ def main():
     other_path = Path(sys.argv[1]) if len(sys.argv) >= 2 else Path(OTHER_FILE_PATH)
     master_path = Path(sys.argv[2]) if len(sys.argv) >= 3 else Path(MASTER_FILE_PATH)
     output_path = Path(sys.argv[3]) if len(sys.argv) == 4 else Path(MASTER_FILE_PATH)
+
+    print(f"Propagating {config.YEAR} mismatch highlights")
+    print(f"  Master (source of highlights) : {master_path}")
+    print(f"  Other  (rows to highlight)    : {other_path}")
+    print(f"  Output                        : {output_path}")
+    for label, path in (("Master", master_path), ("Other", other_path)):
+        if not path.exists():
+            raise SystemExit(f"ERROR: {label} workbook not found: {path}")
+    _refuse_if_open_in_excel(output_path)
+    print()
 
     keys, highlight_fill = build_highlighted_key_set(master_path)
     print(f"Found {len(keys)} highlighted rows in master's {SHEET_NAME} sheet.")

@@ -1,7 +1,19 @@
 """
 Consolidate CDCP price file data and PT (provincial/territorial) association fee
-guide data into a "Fee Comparison" workbook, matching the shape of
-Data/Output_2026 Fee Comparison/2026 Fee Comparisons v2.xlsx.
+guide data into a "Fee Comparison" workbook, matching the shape of the
+template workbook (see config.template_workbook).
+
+SCOPE: this script only BUILDS the workbook. It does not check the result
+against anything -- comparing the generated output to the ground truth (row
+matching, per-field match rates, mismatch/missing/extra reporting) is
+compare_fee_files.py's job, and duplicating any of it here just produced a
+second, differently-defined set of numbers to reconcile. Run
+compare_fee_files.py after this to evaluate the output.
+
+The per-province lines printed during a run are build provenance, not
+evaluation: they say how many codes came out of each CDCP price file and
+which fee-guide files supplied the PT fees, so a province with a missing or
+unreadable source is visible while the build is happening.
 
 Covers all five specialty categories: DH, DD, GP, SP (each split into a main
 sheet for all provinces except QC, plus a separate "QC GP"/"QC SP" sheet,
@@ -43,29 +55,36 @@ the full rationale):
     attempted in that case.
 
 Output:
-  - Data/Output_2026 Fee Comparison/2026 Fee Comparisons - generated.xlsx
+  - <Data>/<year>/<year>_Output/<year> Fee Comparisons - generated.xlsx
 """
 
+import re
 import sys
 from pathlib import Path
 
 import openpyxl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config
 from fee_extraction import load_pt_fees, load_pt_fees_by_subspecialty, load_pt_dd_fees, resolve_dd_role_values
 from cdcp_loader import load_cdcp_simple_fees, load_cdcp_sp_rows, load_cdcp_dd_fees
 from sheet_builders import (
     build_dh_sheet, build_gp_sheet, build_qc_gp_sheet,
     build_sp_sheet, build_qc_sp_sheet, build_dd_sheet, copy_claim_lines_sheet,
+    set_year_label_map,
 )
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "Data"
+# Every path below derives from config.YEAR -- change the year there, not
+# here. See scripts/config.py for how each folder name is resolved (the
+# naming convention differs between years).
+BASE_DIR = config.BASE_DIR
+DATA_DIR = config.DATA_DIR
 
-CDCP_DIR = DATA_DIR / "Input_CDCP price files"
-PT_GUIDES_DIR = DATA_DIR / "Input_PT association fee guides"
-TEMPLATE_WORKBOOK = DATA_DIR / "Output_2026 Fee Comparison" / "2026 Fee Comparisons v2.xlsx"
-OUTPUT_WORKBOOK = DATA_DIR / "Output_2026 Fee Comparison" / "2026 Fee Comparisons - generated.xlsx"
+YEAR = config.YEAR
+CDCP_DIR = config.cdcp_dir()
+PT_GUIDES_DIR = config.pt_guides_dir()
+TEMPLATE_WORKBOOK = config.template_workbook()
+OUTPUT_WORKBOOK = config.output_workbook()
 
 # Provinces/territories in the order they'll appear in the output, matching
 # the template's Claim Lines sheet. Not every province has CDCP data for
@@ -74,56 +93,23 @@ OUTPUT_WORKBOOK = DATA_DIR / "Output_2026 Fee Comparison" / "2026 Fee Comparison
 ALL_PROVINCES = ["AB", "BC", "MB", "NB", "NL", "NS", "ON", "PE", "QC", "SK", "NT", "NU", "YT"]
 NON_QC_PROVINCES = [p for p in ALL_PROVINCES if p != "QC"]
 
-# A PT fee more than this many times larger/smaller than the matching CDCP
-# fee is flagged for manual review rather than trusted silently -- it's
-# usually a sign the extractor grabbed the wrong number from an ambiguous
-# source layout.
-PLAUSIBILITY_MIN_RATIO = 0.15
-PLAUSIBILITY_MAX_RATIO = 6.0
-
-
-def report_plausibility(cdcp_fees: dict[str, float], pt_fees: dict[str, float]) -> None:
-    suspects = []
-    for code, pt_fee in pt_fees.items():
-        if not isinstance(pt_fee, (int, float)):
-            # A no-fixed-fee marker like "I.C."/"c.s." (see
-            # fee_extraction._marker_text) isn't a numeric fee to begin
-            # with, so there's no ratio to sanity-check here.
-            continue
-        cdcp_fee = cdcp_fees.get(code)
-        if not cdcp_fee:
-            continue
-        ratio = pt_fee / cdcp_fee
-        if ratio < PLAUSIBILITY_MIN_RATIO or ratio > PLAUSIBILITY_MAX_RATIO:
-            suspects.append((code, pt_fee, cdcp_fee, ratio))
-    if suspects:
-        print(f"    REVIEW: {len(suspects)} code(s) with an implausible PT/CDCP fee ratio "
-              f"(possible extraction error, verify manually):")
-        for code, pt_fee, cdcp_fee, ratio in suspects:
-            print(f"      {code}: PT=${pt_fee:.2f} CDCP=${cdcp_fee:.2f} (ratio {ratio:.2f}x)")
-
-
 def resolve_pt_fees(specialty_dir: Path, province: str, known_codes: set[str], label: str):
     pt_fees, sources_used, files_found = load_pt_fees(specialty_dir, province, known_codes, verbose=False)
     source_desc = ", ".join(f"{name} ({n})" for name, n in sources_used) or "no PT fee guide found"
-    print(f"{province} {label}: {len(known_codes)} CDCP codes, {len(pt_fees)} PT fees matched -- {source_desc}")
+    print(f"{province} {label}: {len(known_codes)} CDCP codes, {len(pt_fees)} PT fees extracted -- {source_desc}")
     if not files_found:
         print(f"    Note: no PT fee guide file found for {province}/{label}; PT fees will be 'N/A'.")
     return pt_fees
 
 
-def process_dh(wb_new, template_ws) -> tuple[int, int]:
+def process_dh(wb_new, template_ws) -> None:
     specialty_dir = PT_GUIDES_DIR / "DH"
     rows = []
-    total_codes = total_matched = 0
     for province in ALL_PROVINCES:
         cdcp_fees = load_cdcp_simple_fees(CDCP_DIR, province, "DH", "DH")
         if not cdcp_fees:
             continue
         pt_fees = resolve_pt_fees(specialty_dir, province, set(cdcp_fees.keys()), "DH")
-        report_plausibility(cdcp_fees, pt_fees)
-        total_codes += len(cdcp_fees)
-        total_matched += len(pt_fees)
         rows.append((province, "DH", cdcp_fees, pt_fees))
 
     dh_rows = [
@@ -132,39 +118,31 @@ def process_dh(wb_new, template_ws) -> tuple[int, int]:
         for code in sorted(cdcp_fees.keys())
     ]
     build_dh_sheet(wb_new, template_ws, dh_rows)
-    return total_codes, total_matched
 
 
-def process_gp(wb_new, template_ws) -> tuple[int, int]:
+def process_gp(wb_new, template_ws) -> None:
     specialty_dir = PT_GUIDES_DIR / "GP"
     rows = []
-    total_codes = total_matched = 0
     for province in NON_QC_PROVINCES:
         cdcp_fees = load_cdcp_simple_fees(CDCP_DIR, province, "GP", "GP", require_fee=False)
         if not cdcp_fees:
             continue
         pt_fees = resolve_pt_fees(specialty_dir, province, set(cdcp_fees.keys()), "GP")
-        report_plausibility(cdcp_fees, pt_fees)
-        total_codes += len(cdcp_fees)
-        total_matched += len(pt_fees)
         for code in sorted(cdcp_fees.keys()):
             rows.append((province, code, cdcp_fees.get(code), pt_fees.get(code)))
 
     build_gp_sheet(wb_new, template_ws, rows)
-    return total_codes, total_matched
 
 
-def process_qc_gp(wb_new, template_ws) -> tuple[int, int]:
+def process_qc_gp(wb_new, template_ws) -> None:
     specialty_dir = PT_GUIDES_DIR / "GP"
     cdcp_fees = load_cdcp_simple_fees(CDCP_DIR, "QC", "GP", "GP", require_fee=False)
     if not cdcp_fees:
         build_qc_gp_sheet(wb_new, template_ws, [])
-        return 0, 0
+        return
     pt_fees = resolve_pt_fees(specialty_dir, "QC", set(cdcp_fees.keys()), "QC GP")
-    report_plausibility(cdcp_fees, pt_fees)
     rows = [(code, cdcp_fees.get(code), pt_fees.get(code)) for code in sorted(cdcp_fees.keys())]
     build_qc_gp_sheet(wb_new, template_ws, rows)
-    return len(cdcp_fees), len(pt_fees)
 
 
 def _codes_by_subspecialty(sp_rows: list[tuple[str, str, float | None]]) -> dict[str, set[str]]:
@@ -174,10 +152,9 @@ def _codes_by_subspecialty(sp_rows: list[tuple[str, str, float | None]]) -> dict
     return codes_by_sub
 
 
-def process_sp(wb_new, template_ws) -> tuple[int, int]:
+def process_sp(wb_new, template_ws) -> None:
     specialty_dir = PT_GUIDES_DIR / "SP"
     rows = []
-    total_codes = total_matched = 0
     for province in NON_QC_PROVINCES:
         sp_rows = load_cdcp_sp_rows(CDCP_DIR, province, require_fee=False)
         if not sp_rows:
@@ -187,117 +164,178 @@ def process_sp(wb_new, template_ws) -> tuple[int, int]:
             gp_specialty_dir=PT_GUIDES_DIR / "GP", verbose=False,
         )
         source_desc = ", ".join(f"{name} ({n})" for name, n in sources_used) or "no PT fee guide found"
-        print(f"{province} SP: {len(sp_rows)} CDCP codes, {len(pt_fees)} PT fees matched -- {source_desc}")
+        print(f"{province} SP: {len(sp_rows)} CDCP codes, {len(pt_fees)} PT fees extracted -- {source_desc}")
         if not files_found:
             print(f"    Note: no PT fee guide file found for {province}/SP; PT fees will be 'N/A'.")
-        cdcp_fees_by_key = {(code, sub): fee for code, sub, fee in sp_rows}
-        report_plausibility(cdcp_fees_by_key, pt_fees)
-        total_codes += len(sp_rows)
-        total_matched += sum(1 for code, sub, _ in sp_rows if (code, sub) in pt_fees)
         for code, sub_specialty, cdcp_fee in sorted(sp_rows, key=lambda t: (t[1], t[0])):
             rows.append((province, sub_specialty, code, cdcp_fee, pt_fees.get((code, sub_specialty))))
 
     build_sp_sheet(wb_new, template_ws, rows)
-    return total_codes, total_matched
 
 
-def process_qc_sp(wb_new, template_ws) -> tuple[int, int]:
+def process_qc_sp(wb_new, template_ws) -> None:
     specialty_dir = PT_GUIDES_DIR / "SP"
     sp_rows = load_cdcp_sp_rows(CDCP_DIR, "QC", require_fee=False)
     if not sp_rows:
         build_qc_sp_sheet(wb_new, template_ws, [])
-        return 0, 0
+        return
     pt_fees, sources_used, files_found = load_pt_fees_by_subspecialty(
         specialty_dir, "QC", _codes_by_subspecialty(sp_rows),
         gp_specialty_dir=PT_GUIDES_DIR / "GP", verbose=False,
     )
     source_desc = ", ".join(f"{name} ({n})" for name, n in sources_used) or "no PT fee guide found"
-    print(f"QC QC SP: {len(sp_rows)} CDCP codes, {len(pt_fees)} PT fees matched -- {source_desc}")
+    print(f"QC QC SP: {len(sp_rows)} CDCP codes, {len(pt_fees)} PT fees extracted -- {source_desc}")
     if not files_found:
         print("    Note: no PT fee guide file found for QC/QC SP; PT fees will be 'N/A'.")
-    cdcp_fees_by_key = {(code, sub): fee for code, sub, fee in sp_rows}
-    report_plausibility(cdcp_fees_by_key, pt_fees)
     rows = [
         (sub_specialty, code, cdcp_fee, pt_fees.get((code, sub_specialty)))
         for code, sub_specialty, cdcp_fee in sorted(sp_rows, key=lambda t: (t[1], t[0]))
     ]
     build_qc_sp_sheet(wb_new, template_ws, rows)
-    matched = sum(1 for code, sub, _ in sp_rows if (code, sub) in pt_fees)
-    return len(sp_rows), matched
 
 
 def resolve_pt_dd_fees(specialty_dir: Path, province: str, known_codes: set[str]):
     role_fees, sources_used, files_found = load_pt_dd_fees(specialty_dir, province, known_codes, verbose=False)
     source_desc = ", ".join(f"{name} ({n})" for name, n in sources_used) or "no PT fee guide found"
-    print(f"{province} DD: {len(known_codes)} CDCP codes, {len(role_fees)} PT fees matched -- {source_desc}")
+    print(f"{province} DD: {len(known_codes)} CDCP codes, {len(role_fees)} PT fees extracted -- {source_desc}")
     if not files_found:
         print(f"    Note: no PT fee guide file found for {province}/DD; PT fees will be 'N/A'.")
     return role_fees
 
 
-def process_dd(wb_new, template_ws) -> tuple[int, int]:
+def process_dd(wb_new, template_ws) -> None:
     specialty_dir = PT_GUIDES_DIR / "DD"
     rows = []
-    total_codes = total_matched = 0
     for province in ALL_PROVINCES:
         cdcp_fees = load_cdcp_dd_fees(CDCP_DIR, province)
         if not cdcp_fees:
             continue
-        prof_fees_only = {code: prof for code, (prof, _lab) in cdcp_fees.items()}
         role_fees = resolve_pt_dd_fees(specialty_dir, province, set(cdcp_fees.keys()))
-        pt_combo_fees = {}
-        for code, values in role_fees.items():
-            combo = resolve_dd_role_values(values)[2]
-            if combo is not None:
-                pt_combo_fees[code] = combo
-        report_plausibility(prof_fees_only, pt_combo_fees)
-        total_codes += len(cdcp_fees)
-        total_matched += len(role_fees)
         for code in sorted(cdcp_fees.keys()):
             pt_prof, pt_lab, pt_combo = resolve_dd_role_values(role_fees.get(code, {}))
             rows.append((province, code, cdcp_fees[code], (pt_prof, pt_lab, pt_combo)))
 
     build_dd_sheet(wb_new, template_ws, rows)
-    return total_codes, total_matched
+
+
+_YEAR_IN_TEXT_RE = re.compile(r"\b(20\d{2})\b")
+
+
+def template_years(template_wb) -> list[int]:
+    """The distinct years the template's own header rows are labelled with,
+    oldest first.
+
+    Detected rather than configured so the template can be relabelled or
+    replaced without a matching config edit -- only the years we want *out*
+    (config.PAST_YEAR / CURRENT_YEAR) need stating. Only the first two rows
+    of each sheet are scanned: that's where the year labels live, and it
+    keeps a stray year inside the data (a procedure description mentioning
+    2019, say) from being mistaken for a column label."""
+    found: set[int] = set()
+    for name in config.REQUIRED_TEMPLATE_SHEETS:
+        if name not in template_wb.sheetnames:
+            continue
+        ws = template_wb[name]
+        for row in ws.iter_rows(min_row=1, max_row=2):
+            for cell in row:
+                if isinstance(cell.value, str):
+                    found.update(int(m) for m in _YEAR_IN_TEXT_RE.findall(cell.value))
+    return sorted(found)
+
+
+def build_year_label_map(template_wb) -> dict[int, int]:
+    """Map each year in the template's headers to the year it should read as
+    in the generated workbook.
+
+    The output carries two years side by side, so the template's older year
+    becomes config.past_year() and its newer one config.current_year(). A
+    template already labelled for the target years yields an identity map
+    (i.e. no relabelling), which is the normal 2026 case."""
+    years = template_years(template_wb)
+    target_past, target_current = config.past_year(), config.current_year()
+    if len(years) >= 2:
+        # Oldest -> past, newest -> current. Anything between (templates
+        # shouldn't have any, but be explicit) is left alone rather than
+        # guessed at.
+        return {years[0]: target_past, years[-1]: target_current}
+    if len(years) == 1:
+        return {years[0]: target_current}
+    return {}
 
 
 def main() -> None:
+    # Printed up front so a mis-resolved folder is obvious immediately rather
+    # than surfacing as a run full of "no PT fee guide found" notes. The
+    # legacy 2026 folder names carry no year in them, so if a year's own
+    # folder is missing the resolver can fall back to a differently-yeared
+    # one -- this banner is what makes that visible.
+    print(f"=== Building {YEAR} Fee Comparison ===")
+    print(f"  CDCP price files : {CDCP_DIR}")
+    print(f"  PT fee guides    : {PT_GUIDES_DIR}")
+    print(f"  Template         : {TEMPLATE_WORKBOOK}")
+    print(f"  Output           : {OUTPUT_WORKBOOK}")
+    for label, path in (("CDCP price files", CDCP_DIR), ("PT fee guides", PT_GUIDES_DIR)):
+        if not path.exists():
+            print(f"  WARNING: {label} not found at the path above.")
+
+    # Checked here, not deep in the build: a workbook that isn't really the
+    # template used to surface as "KeyError: 'Worksheet Claim Lines does not
+    # exist.'" partway through, which says nothing about the actual problem.
+    if not TEMPLATE_WORKBOOK.exists():
+        looked = "\n    ".join(str(p) for p in config.template_candidates())
+        raise SystemExit(
+            f"\nERROR: no template workbook found. A template must contain the sheets "
+            f"{', '.join(config.REQUIRED_TEMPLATE_SHEETS)}.\n"
+            f"  Looked in:\n    {looked}\n"
+            f"  Set config.TEMPLATE_FILE (or the OHB_TEMPLATE environment variable) "
+            f"to point at it directly."
+        )
+    if not config._has_required_sheets(TEMPLATE_WORKBOOK):
+        raise SystemExit(
+            f"\nERROR: {TEMPLATE_WORKBOOK.name} is missing one or more required sheets "
+            f"({', '.join(config.REQUIRED_TEMPLATE_SHEETS)}), so it can't be used as the "
+            f"template.\n  Set config.TEMPLATE_FILE (or OHB_TEMPLATE) to the real template."
+        )
+
     template_wb = openpyxl.load_workbook(TEMPLATE_WORKBOOK, data_only=False)
+
+    # One template serves every year; only its year labels are rewritten.
+    year_map = build_year_label_map(template_wb)
+    set_year_label_map(year_map)
+    if year_map and any(k != v for k, v in year_map.items()):
+        relabel = ", ".join(f"{k} -> {v}" for k, v in sorted(year_map.items()))
+        print(f"  Header years     : {relabel}")
+    else:
+        print(f"  Header years     : {config.past_year()}, {config.current_year()} (template already matches)")
+    print()
 
     wb_new = openpyxl.Workbook()
     wb_new.remove(wb_new.active)
     copy_claim_lines_sheet(wb_new, template_wb["Claim Lines"])
 
-    overall_codes = overall_matched = 0
-
     print("=== DH ===")
-    codes, matched = process_dh(wb_new, template_wb["DH"])
-    overall_codes += codes; overall_matched += matched
+    process_dh(wb_new, template_wb["DH"])
 
     print("\n=== GP ===")
-    codes, matched = process_gp(wb_new, template_wb["GP"])
-    overall_codes += codes; overall_matched += matched
+    process_gp(wb_new, template_wb["GP"])
 
     print("\n=== QC GP ===")
-    codes, matched = process_qc_gp(wb_new, template_wb["QC GP"])
-    overall_codes += codes; overall_matched += matched
+    process_qc_gp(wb_new, template_wb["QC GP"])
 
     print("\n=== SP ===")
-    codes, matched = process_sp(wb_new, template_wb["SP"])
-    overall_codes += codes; overall_matched += matched
+    process_sp(wb_new, template_wb["SP"])
 
     print("\n=== QC SP ===")
-    codes, matched = process_qc_sp(wb_new, template_wb["QC SP"])
-    overall_codes += codes; overall_matched += matched
+    process_qc_sp(wb_new, template_wb["QC SP"])
 
     print("\n=== DD ===")
-    codes, matched = process_dd(wb_new, template_wb["DD"])
-    overall_codes += codes; overall_matched += matched
+    process_dd(wb_new, template_wb["DD"])
 
+    # A year being built for the first time won't have an output folder yet.
+    OUTPUT_WORKBOOK.parent.mkdir(parents=True, exist_ok=True)
     wb_new.save(OUTPUT_WORKBOOK)
     print(f"\nSaved {OUTPUT_WORKBOOK}")
-    print(f"Overall PT fee match rate: {overall_matched}/{overall_codes} "
-          f"({100 * overall_matched / overall_codes:.1f}%)")
+    print("Run compare_fee_files.py to check this output against the ground truth.")
 
 
 if __name__ == "__main__":

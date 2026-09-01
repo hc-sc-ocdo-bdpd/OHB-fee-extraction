@@ -17,15 +17,48 @@ as the DH sheet -- that data isn't available from the CDCP/PT input files.
 """
 
 import copy
+import re
 
 from openpyxl.utils import get_column_letter
+
+
+# Maps a year found in the template's headers to the year that should appear
+# in the generated output, e.g. {2025: 2024, 2026: 2025} when building 2025
+# from a template written for 2026. Set once per run by
+# build_fee_comparison.main via set_year_label_map; empty means "copy header
+# text through unchanged", which is what happens when the template's years
+# already match the ones being built.
+_YEAR_LABEL_MAP: dict[int, int] = {}
+_YEAR_IN_TEXT_RE = re.compile(r"\b(20\d{2})\b")
+
+
+def set_year_label_map(mapping: dict[int, int]) -> None:
+    """Install the template-year -> output-year relabelling used by
+    copy_header_rows and copy_claim_lines_sheet. See
+    build_fee_comparison.build_year_label_map for how it's derived."""
+    global _YEAR_LABEL_MAP
+    _YEAR_LABEL_MAP = dict(mapping)
+
+
+def retarget_years(value):
+    """Rewrite any 4-digit year in a header/label string to the year being
+    built. Non-string values and strings with no year pass through untouched.
+
+    This is what lets ONE template serve every year: the layout, styling and
+    formulas are identical between years, and only the year written into the
+    column labels differs."""
+    if not _YEAR_LABEL_MAP or not isinstance(value, str):
+        return value
+    return _YEAR_IN_TEXT_RE.sub(
+        lambda m: str(_YEAR_LABEL_MAP.get(int(m.group(1)), m.group(1))), value
+    )
 
 
 def copy_header_rows(ws, template_ws, num_header_rows: int, num_cols: int) -> None:
     for r in range(1, num_header_rows + 1):
         for c in range(1, num_cols + 1):
             src = template_ws.cell(r, c)
-            dst = ws.cell(r, c, src.value)
+            dst = ws.cell(r, c, retarget_years(src.value))
             dst.font = copy.copy(src.font)
             dst.fill = copy.copy(src.fill)
             dst.alignment = copy.copy(src.alignment)
@@ -340,7 +373,12 @@ def copy_claim_lines_sheet(wb_new, template_ws) -> None:
             src = template_ws.cell(r, c)
             if src.value is None:
                 continue
-            dst = ws.cell(r, c, src.value)
+            # Claim Lines carries year labels of its own; relabel them the
+            # same way as the sheet headers so the whole workbook reads as
+            # one year rather than a mix. Formulas are strings too, but they
+            # reference cells and sheet names (no bare 20xx tokens), so
+            # they're unaffected.
+            dst = ws.cell(r, c, retarget_years(src.value))
             dst.font = copy.copy(src.font)
             dst.fill = copy.copy(src.fill)
             dst.alignment = copy.copy(src.alignment)

@@ -15,11 +15,13 @@ CDCP price file) to avoid false positives on category headers/page numbers.
 
 import csv
 import re
+from functools import lru_cache
 from pathlib import Path
 
 import openpyxl
 import pypdf
 import xlrd
+import config
 from docx import Document
 from docx.oxml.ns import qn
 from docx.table import Table as _DocxTable
@@ -58,8 +60,17 @@ _FRENCH_GROUPED_NO_DOLLAR_RE = re.compile(r"(?<!\d)\d{1,3}(?:[\s ]\d{3})+(?:[.,
 # _FEE_TOKEN_TIERS) never fires for it and it just resolves to nothing.
 # "B.R." ("By Report") is AB's DD guide's own version of the same idea --
 # the fee is individually assessed and reported, not fixed.
+# "NO FEE" (NB's and NS's guides) and "N/C" / "N.C." ("No Charge" -- NS's and
+# BC's) are the same idea again: the guide is stating this code has no fee, not
+# failing to state one. Without them such a cell matches no tier at all and the
+# code resolves to nothing, which is indistinguishable in the output from an
+# extraction failure (confirmed on NB 93301/93302/99901/99902, NS
+# 73221/93301/93302/93318/93341, BC PA 93301/93302/93318). Safe to match
+# loosely here because this pattern is anchored to the WHOLE cell -- a
+# description merely mentioning "no fee" in passing never matches.
 _NO_FEE_MARKER_RE = re.compile(
-    r"^\s*(?:I\.?\s*C\.?|c\.?\s*s\.?|s\.?\s*c\.?|(?:actual\s+)?lab(?:\s+fee)?|B\.?\s*R\.?)\s*\.?\s*$",
+    r"^\s*(?:I\.?\s*C\.?|c\.?\s*s\.?|s\.?\s*c\.?|(?:actual\s+)?lab(?:\s+fee)?|B\.?\s*R\.?"
+    r"|no\s*fee|n\s*[/.]?\s*c\.?)\s*\.?\s*$",
     re.IGNORECASE,
 )
 
@@ -73,6 +84,27 @@ _ALPHA_CODE_RE = re.compile(r"^[A-Z]\d{3,5}$")
 
 
 def normalize_code(raw) -> str | None:
+    """Cached wrapper -- see _normalize_code for the real logic and docs.
+
+    This is the single hottest call in the pipeline: every cell of every row
+    of every source is passed through it, and for SP the same rows are
+    rescanned once per sub-specialty (~10x). Cell values repeat heavily
+    across a guide, so memoizing on the raw value collapses almost all of
+    that. Unhashable cell types (none occur in practice, but openpyxl can
+    surface exotic ones) fall through to the uncached path rather than
+    raising."""
+    try:
+        return _normalize_code_cached(raw)
+    except TypeError:
+        return _normalize_code(raw)
+
+
+@lru_cache(maxsize=200_000)
+def _normalize_code_cached(raw) -> str | None:
+    return _normalize_code(raw)
+
+
+def _normalize_code(raw) -> str | None:
     """Normalize a procedure code (int or str, possibly missing leading zeros) to 5 digits.
 
     Codes are always whole numbers, so a fractional float (e.g. a $221.75 fee
@@ -172,6 +204,14 @@ def _fee_candidates(cell) -> list[float]:
     # comes back in left-to-right reading order -- callers take the *last*
     # candidate as the fee (see extract_codes_from_rows), so losing that
     # order would silently swap which end of a range wins.
+    # A cell whose entire content is one bare number is that row's fee,
+    # whatever its magnitude -- the small-whole-number exclusion below exists
+    # to ignore a quantity mentioned inside descriptive prose ("1 unit of
+    # time"), and a cell holding nothing but the number isn't prose. Without
+    # this, a genuine single-digit fee is dropped and the code resolves to
+    # nothing (confirmed on NS 02919, "Each Additional image Over 8" at $8).
+    whole_cell_number = re.fullmatch(r"\s*\$?\s*[\d,]+(?:\.\d+)?\s*", cell) is not None
+
     matches: list[tuple[int, float]] = []
     masked = cell
     for m in _FRENCH_GROUPED_SPACE_RE.finditer(cell):
@@ -203,7 +243,7 @@ def _fee_candidates(cell) -> list[float]:
             value = float(digits)
         except ValueError:
             continue
-        if "." not in token and value < 10:
+        if "." not in token and value < 10 and not whole_cell_number:
             continue
         matches.append((m.start(), value))
     matches.sort(key=lambda t: t[0])
@@ -425,6 +465,16 @@ def extract_codes_from_rows(
 
                 fee = None
                 numeric_candidates = [float(c) for c in other_cells if isinstance(c, (int, float))]
+                # A bare fraction (0 < v < 1) is never a dental fee -- it's a
+                # ratio/percentage column the guide happens to carry. Since
+                # the rightmost candidate wins, such a column silently beats
+                # the real fee whenever it sits to its right (confirmed on
+                # NB's 02811: a stray 0.7232 in column I outranked the actual
+                # $112.31 in column F). Dropped only when some other
+                # candidate is a plausible fee, so a row whose only number is
+                # fractional is left exactly as it was.
+                if any(v >= 1 for v in numeric_candidates):
+                    numeric_candidates = [v for v in numeric_candidates if not (0 < v < 1)]
                 # A row whose fee cell is a standalone "I.C."/"c.s."/"S.C."/
                 # "lab" marker (no fixed fee, by design) resolves to that
                 # exact text rather than a number -- a code the source
@@ -471,6 +521,22 @@ def extract_codes_from_rows(
             # reference treats that first, overall row as the code's fee.
             if exact:
                 fees[code] = exact[0]
+            elif len(candidates) == 1:
+                # The code is priced exactly ONCE in this file, under some
+                # other specialty's heading. With only one row there is
+                # nothing to disambiguate -- the label is telling us which
+                # section of the guide the code was printed in, not that the
+                # fee is off-limits to anyone else -- so that single fee is
+                # the guide's fee for this code, whoever is asking.
+                #
+                # This only fires when a specialty label was found at all
+                # (labeled_candidates is only populated for a
+                # target_specialty request) and never overrides an exact
+                # match above. A code appearing two or more times is left to
+                # the rules below, which is what keeps a *different*
+                # specialty's premium row from winning where the guide
+                # really does price the code per specialty.
+                fees[code] = candidates[0][1]
             elif neutral:
                 fees[code] = neutral[0]
             else:
@@ -508,6 +574,82 @@ def extract_codes_from_rows(
     return fees
 
 
+# ---------------------------------------------------------------------------
+# Parsed-source cache.
+#
+# Every reader below is a pure function of the file on disk, and the same file
+# gets re-read many times in one run: load_pt_fees_from_files is called once
+# per sub-specialty (~10x per province for SP) over the same candidate file
+# list, and each call re-opened every workbook and re-extracted every PDF's
+# text from scratch. Parsing dominates the runtime -- the scanning that
+# follows is comparatively cheap -- so memoizing the parse step is where the
+# time is.
+#
+# Keyed on the path string (Path isn't hashable-stable across equal-but-
+# distinct instances in a way lru_cache can rely on for readability here) plus
+# whatever options change the result. Cached values are tuples so an
+# accidental mutation by one caller can't corrupt what the next one sees;
+# every consumer treats rows as read-only (extract_codes_from_rows copies via
+# list(row) before touching anything).
+#
+# Files are assumed not to change mid-run, which is true for this pipeline.
+# Call clear_source_caches() if that ever stops being true.
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=None)
+def _cached_spreadsheet_by_sheet(path_str: str) -> tuple:
+    return tuple(_read_spreadsheet_by_sheet(Path(path_str)))
+
+
+@lru_cache(maxsize=None)
+def _cached_csv_tables(path_str: str) -> tuple:
+    return tuple(_read_csv_tables(Path(path_str)))
+
+
+@lru_cache(maxsize=None)
+def _cached_docx_tables(path_str: str) -> tuple:
+    return tuple(_read_docx_tables(Path(path_str)))
+
+
+@lru_cache(maxsize=None)
+def _cached_docx_paragraph_text(path_str: str) -> str:
+    return _read_docx_paragraph_text(Path(path_str))
+
+
+@lru_cache(maxsize=None)
+def _cached_pdf_page_texts(path_str: str, layout: bool) -> tuple[str, ...]:
+    """Per-page extracted text for one PDF in one extraction mode.
+
+    Page-level rather than whole-document so load_fees_from_abbreviated_pdf
+    (which works page by page) and the whole-document readers can share one
+    cache entry instead of each extracting the file separately."""
+    reader = pypdf.PdfReader(path_str)
+    if layout:
+        return tuple(page.extract_text(extraction_mode="layout") or "" for page in reader.pages)
+    return tuple(page.extract_text() or "" for page in reader.pages)
+
+
+def pdf_page_texts(path: Path, layout: bool = False) -> tuple[str, ...]:
+    return _cached_pdf_page_texts(str(path), layout)
+
+
+def pdf_text(path: Path, layout: bool = False) -> str:
+    """Whole-document extracted text, joined the same way every caller in this
+    module previously joined it (newline between pages)."""
+    return "\n".join(pdf_page_texts(path, layout))
+
+
+def clear_source_caches() -> None:
+    """Drop every memoized parse. Only needed if input files are rewritten
+    while the process is still running."""
+    for fn in (
+        _cached_spreadsheet_by_sheet, _cached_csv_tables, _cached_docx_tables,
+        _cached_docx_paragraph_text, _cached_pdf_page_texts, _cached_discover_pt_files,
+    ):
+        fn.cache_clear()
+
+
 def tables_from_spreadsheet_by_sheet(path: Path):
     """Like tables_from_spreadsheet, but yields (sheet_title, header,
     data_rows) triples -- used when a source splits sub-specialties across
@@ -515,6 +657,10 @@ def tables_from_spreadsheet_by_sheet(path: Path):
     (see discover_pt_files) or a per-row specialty column (see
     find_row_specialty_column) -- e.g. QC's combined SP guide, with sheets
     named "Endodontie", "Parodontie", etc."""
+    yield from _cached_spreadsheet_by_sheet(str(path))
+
+
+def _read_spreadsheet_by_sheet(path: Path):
     suffix = path.suffix.lower()
     if suffix in {".xlsx", ".xlsm"}:
         wb = openpyxl.load_workbook(path, data_only=True)
@@ -583,34 +729,20 @@ def classify_sheet_specialty(title: str) -> set[str]:
 def tables_from_spreadsheet(path: Path):
     """Yields (header, data_rows) per worksheet. The first row of each sheet
     is treated as the header if it looks like one (see _looks_like_header);
-    otherwise every row in that sheet is treated as data with no header."""
-    suffix = path.suffix.lower()
-    if suffix in {".xlsx", ".xlsm"}:
-        wb = openpyxl.load_workbook(path, data_only=True)
-        for ws in wb.worksheets:
-            rows_iter = ws.iter_rows(values_only=True)
-            first = next(rows_iter, None)
-            if first is None:
-                continue
-            if _looks_like_header(first):
-                yield first, list(rows_iter)
-            else:
-                yield None, [first, *rows_iter]
-    elif suffix == ".xls":
-        wb = xlrd.open_workbook(str(path))
-        for sheet in wb.sheets():
-            if sheet.nrows == 0:
-                continue
-            all_rows = [sheet.row_values(i) for i in range(sheet.nrows)]
-            if _looks_like_header(all_rows[0]):
-                yield all_rows[0], all_rows[1:]
-            else:
-                yield None, all_rows
-    else:
-        raise ValueError(f"Unsupported spreadsheet suffix: {suffix}")
+    otherwise every row in that sheet is treated as data with no header.
+
+    Shares one cache entry with tables_from_spreadsheet_by_sheet -- the two
+    differ only in whether the sheet title is included, so parsing the
+    workbook twice for the two shapes would be wasted work."""
+    for _title, header, rows in _cached_spreadsheet_by_sheet(str(path)):
+        yield header, rows
 
 
 def tables_from_csv(path: Path):
+    yield from _cached_csv_tables(str(path))
+
+
+def _read_csv_tables(path: Path):
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
         all_rows = list(csv.reader(f))
     if not all_rows:
@@ -718,6 +850,10 @@ def _normalize_docx_rows(raw_rows: list[list]) -> list[list]:
 
 
 def tables_from_docx(path: Path):
+    yield from _cached_docx_tables(str(path))
+
+
+def _read_docx_tables(path: Path):
     doc = Document(str(path))
     # Document.tables only returns tables that are *direct* children of the
     # document body -- a table nested inside another table's cell, or (seen
@@ -747,6 +883,10 @@ def tables_from_docx(path: Path):
 
 
 def docx_paragraph_text(path: Path) -> str:
+    return _cached_docx_paragraph_text(str(path))
+
+
+def _read_docx_paragraph_text(path: Path) -> str:
     doc = Document(str(path))
     # Document.paragraphs, like Document.tables (see tables_from_docx), only
     # returns *direct* children of the document body -- paragraphs inside a
@@ -1146,11 +1286,9 @@ def load_fees_from_abbreviated_pdf(path: Path, known_codes: set[str]) -> dict[st
     (confirmed against QC's actual guide). Every page from the first
     index marker onward is skipped entirely for exactly that reason.
     """
-    reader = pypdf.PdfReader(str(path))
     fees: dict[str, float] = {}
     past_index_start = False
-    for page in reader.pages:
-        text = page.extract_text() or ""
+    for text in pdf_page_texts(path):
         if not past_index_start and _BACK_MATTER_INDEX_RE.search(text):
             past_index_start = True
         if past_index_start:
@@ -1190,8 +1328,7 @@ def load_fees_from_abbreviated_pdf(path: Path, known_codes: set[str]) -> dict[st
 
 
 def load_fees_from_pdf(path: Path, known_codes: set[str]) -> dict[str, float | str]:
-    reader = pypdf.PdfReader(str(path))
-    plain_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    plain_text = pdf_text(path)
     plain_fees = extract_codes_from_text(plain_text, known_codes)
     if len(plain_fees) >= len(known_codes):
         return plain_fees
@@ -1207,9 +1344,7 @@ def load_fees_from_pdf(path: Path, known_codes: set[str]) -> dict[str, float | s
     # resolves more codes than the plain pass did -- for a source where plain
     # mode already works (the common case), layout's heavier padding and
     # different line-wrapping isn't worth risking a regression on.
-    layout_text = "\n".join(
-        page.extract_text(extraction_mode="layout") or "" for page in reader.pages
-    )
+    layout_text = pdf_text(path, layout=True)
     layout_fees = extract_codes_from_text(layout_text, known_codes, window_size=_LAYOUT_SEGMENT_SEARCH_WINDOW)
     return layout_fees if len(layout_fees) > len(plain_fees) else plain_fees
 
@@ -1263,7 +1398,31 @@ PROVINCE_ALIASES: dict[str, list[str]] = {
 }
 
 
+@lru_cache(maxsize=None)
+def _cached_dir_listing(dir_str: str) -> tuple[Path, ...]:
+    """Every file under a specialty directory, walked once.
+
+    discover_pt_files is called for each (province, specialty) pair, and each
+    call previously did its own full rglob of the same directory -- 13
+    provinces x 4 specialties re-walking the same trees. The walk result
+    depends only on the directory, so the province filtering below can run
+    against a single cached listing."""
+    root = Path(dir_str)
+    if not root.exists():
+        return ()
+    return tuple(p for p in root.rglob("*") if p.is_file())
+
+
+@lru_cache(maxsize=None)
+def _cached_discover_pt_files(dir_str: str, province: str) -> tuple[Path, ...]:
+    return tuple(_discover_pt_files(Path(dir_str), province))
+
+
 def discover_pt_files(specialty_dir: Path, province: str) -> list[Path]:
+    return list(_cached_discover_pt_files(str(specialty_dir), province))
+
+
+def _discover_pt_files(specialty_dir: Path, province: str) -> list[Path]:
     """Find every file relevant to one province under `specialty_dir`.
 
     Two ways a file can qualify:
@@ -1291,9 +1450,7 @@ def discover_pt_files(specialty_dir: Path, province: str) -> list[Path]:
     ]
 
     matches = []
-    for path in specialty_dir.rglob("*"):
-        if not path.is_file():
-            continue
+    for path in _cached_dir_listing(str(specialty_dir)):
         if any(p.match(path.name) for p in patterns):
             matches.append(path)
         elif any(sub in path.parents for sub in province_subdirs):
@@ -1401,34 +1558,13 @@ def load_pt_fees_from_files(
                 if verbose:
                     print(f"    WARNING: failed to read {f.name}: {e}")
 
-    # Last resort, only for whatever spreadsheet/csv/docx/pdf-text all
-    # failed to resolve: some PDFs (e.g. NL's DD guide) have no extractable
-    # text at all -- their text was flattened to vector curves on export --
-    # so nothing above can ever find anything in them no matter how the
-    # content stream is read. OCR-ing the rendered page image is the only
-    # way to recover data from a file like that. Deliberately tried last and
-    # only for the remaining gap (never re-tried on a pdf that already
-    # resolved fine above) since it's slow and occasionally misreads a
-    # digit, and only imported here so a machine without the OCR
-    # dependencies installed (see ocr_pdf_fees.py) just skips this tier
-    # instead of failing the whole extraction run.
-    if pdfs and (known_codes - fees.keys()):
-        try:
-            from ocr_pdf_fees import load_fees_from_pdf_via_ocr
-        except ImportError as e:
-            if verbose:
-                print(f"    WARNING: OCR fallback unavailable ({e}); skipping")
-        else:
-            for f in pdfs:
-                remaining = known_codes - fees.keys()
-                if not remaining:
-                    break
-                try:
-                    _apply(f"{f.name} (OCR)", load_fees_from_pdf_via_ocr(f, remaining))
-                except Exception as e:
-                    if verbose:
-                        print(f"    WARNING: OCR failed for {f.name}: {e}")
-
+    # NOTE: there used to be a final OCR tier here (ocr_pdf_fees.py) for PDFs
+    # whose text was flattened to vector curves on export, so no amount of
+    # content-stream reading recovers anything (NL's DD guide was the one
+    # confirmed case). It has been removed at the project's request. A PDF of
+    # that kind now simply contributes nothing and its codes come out "N/A"
+    # -- which is the honest result, but note it's indistinguishable from an
+    # ordinary extraction miss.
     return fees, sources_used
 
 
@@ -1451,10 +1587,12 @@ _DD_PROF_HEADER_RE = re.compile(r"\bprof(essional)?\b|honoraires", re.IGNORECASE
 _DD_LAB_HEADER_RE = re.compile(r"\blab\b|laboratoire|frais\s*de\s*lab", re.IGNORECASE)
 _DD_TOTAL_HEADER_RE = re.compile(r"\btotal\b", re.IGNORECASE)
 _YEAR_TOKEN_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
-# This project's fee guides are all for the 2026 rate year -- a header
-# naming *that* year ("Total Fee 2026") is still the current column, but one
-# naming an earlier year ("2025 Prof Fee") is a prior-year column to ignore.
-_CURRENT_GUIDE_YEAR = 2026
+# A header naming the rate year being built ("Total Fee 2026") is the current
+# column; one naming an EARLIER year ("2025 Prof Fee") is a prior-year column
+# to ignore. Driven by config.YEAR so running a different year automatically
+# shifts what counts as "prior" -- left hardcoded, a 2025 run would treat
+# 2025's own columns as stale and silently skip them.
+_CURRENT_GUIDE_YEAR = config.YEAR
 
 
 def _dd_column_role(cell) -> str | None:
@@ -1660,7 +1798,20 @@ def extract_dd_codes_from_rows(tables, known_codes: set[str]) -> dict[str, dict[
 
 
 _DD_PDF_LINE_CODE_RE = re.compile(r"\b(\d{5})\b")
-_DD_PDF_NUMBER_RE = re.compile(r"\d[\d,]*\.\d{2}")
+# "\.{1,2}" tolerates a doubled decimal point -- a typo in the source, not an
+# extraction artifact: AB's DD guide prints code 33227's total as "605..00"
+# while its identical sibling row 33217 one line above prints "605.00". With
+# a strict single "\.", the malformed figure isn't recognized as a number at
+# all, so the line yields only two of its three values, fails the
+# Prof + Lab == Total check below, and falls through to the generic
+# single-fee scanner -- which reported the Lab figure (241) as the Prof fee.
+_DD_PDF_NUMBER_RE = re.compile(r"\d[\d,]*\.{1,2}\d{2}")
+
+
+def _parse_dd_number(text: str) -> float:
+    """Parse a fee token matched by _DD_PDF_NUMBER_RE, tolerating the
+    doubled decimal point that regex deliberately accepts (see above)."""
+    return float(text.replace(",", "").replace("..", "."))
 
 # A Prof fee immediately followed by a Lab fee marked "+L" -- a variable,
 # unspecified additional lab charge, not a fixed number (seen in PE's DD
@@ -1744,7 +1895,7 @@ def extract_dd_codes_from_lines(text: str, known_codes: set[str]) -> dict[str, d
         if code not in known_codes or code in results:
             continue
         segment = line[code_match.end():]
-        numbers = [float(n.replace(",", "")) for n in _DD_PDF_NUMBER_RE.findall(segment)]
+        numbers = [_parse_dd_number(n) for n in _DD_PDF_NUMBER_RE.findall(segment)]
         if not numbers:
             # No numbers at all -- but a no-fixed-fee marker ("S.C.", "I.C.",
             # "B.R.", ...) can appear on the line instead, printed twice the
@@ -2032,11 +2183,7 @@ def load_pt_dd_fees_from_files(files: list[Path], known_codes: set[str], verbose
         if not remaining:
             break
         try:
-            reader = pypdf.PdfReader(str(f))
-            layout_text = "\n".join(
-                page.extract_text(extraction_mode="layout") or "" for page in reader.pages
-            )
-            new_fees = extract_dd_codes_from_lines(layout_text, remaining)
+            new_fees = extract_dd_codes_from_lines(pdf_text(f, layout=True), remaining)
         except Exception as e:
             if verbose:
                 print(f"    WARNING: failed to read {f.name}: {e}")
@@ -2149,13 +2296,7 @@ SUBSPECIALTY_FILE_MARKERS: dict[str, list[str]] = {
     "OP": ["OP", "ORAL PATHOLOGY"],
     "OR": ["OR", "ORT", "ORTHODONTIC", "ORTHODONTICS"],
     "RA": ["RA", "RADIOLOGY"],
-    # "DA" (Dental Anaesthesia) is Ontario's name for this guide. Without it
-    # ON_DA_Fee_Guide_2026.xlsx classifies as *unspecific* and so becomes the
-    # general fallback consulted for every other sub-specialty -- which is
-    # how OM/OP/RA codes were resolving to anaesthesia rates. Confirmed by
-    # the data: 54 flagged ON rows for CDCP specialty "AN" match that file's
-    # value exactly, and nothing else's.
-    "AN": ["AN", "DA", "ANESTHESIA", "ANESTHESIOLOGY", "DENTAL ANAESTHESIA"],
+    "AN": ["AN", "ANESTHESIA", "ANESTHESIOLOGY"],
 }
 
 
@@ -2176,29 +2317,29 @@ for _code, _markers in SUBSPECIALTY_FILE_MARKERS.items():
     for _marker in _markers:
         _ALL_SPECIALTY_MARKERS.setdefault(_marker, _code)
 
-# Some SP guides label each row's specialty with a small internal
-# reference *number* instead of a letter abbreviation -- confirmed in SK's
-# Specialist Fee Guide, whose own numeric column uses 21-30 as
-# section/category numbers, cross-checked against that guide's own section
-# headings (e.g. 24 = "PERIODONTICS, ...", 29 = "ENDODONTIC SERVICES").
-# Only mapped where a number corresponds to exactly one CDCP sub-specialty
-# -- SK's "28" section merges Oral Medicine and Oral Pathology together
-# under one number with no way to tell them apart from the number alone,
-# and 21/22/30 are generic categories (Diagnostic, Radiology, Adjunctive)
-# that aren't any one sub-specialty at all -- so those are deliberately
-# left unmapped rather than guessed at (see _classify_specialty_cell).
-_NUMERIC_SPECIALTY_MARKERS: dict[int, str] = {
-    23: "PA",  # SK: "PEDIATRIC, ..." -- CDCP's "PA" is Pediatric Dentistry
-    24: "PE",  # SK: "PERIODONTICS, ..." -- CDCP's "PE" is Periodontics
-    25: "OS",  # SK: "ORAL&MAXILLOFACIAL SURG"
-    26: "PR",  # SK: "PROSTHO SERV..."
-    29: "EN",  # SK: "ENDODONTIC..."
-}
+# NOTE: a numeric section index is deliberately NOT read as a specialty
+# label. SK's Specialist Fee Guide carries a column of small numbers
+# (21-30) beside a matching section *name* ("21 DIAGNOSTIC", "23 PEDIATRIC,
+# Restorations", "25 ORAL&MAXILLOFACIAL SURG", "29 ENDODONTICS, ROOT
+# CANAL"), and these were previously mapped 23->PA, 24->PE, 25->OS,
+# 26->PR, 29->EN. That reads the column as "which specialist may bill this
+# row", which it is not: it indexes the *procedure category* a code sits
+# under, and the guide quotes ONE fee per code for every specialist.
+# Measured directly on the 2026 guide: 321 of its 1459 codes appear under
+# two or more different sections, and in ZERO of those cases does the fee
+# differ between sections. So the column can never disambiguate a fee --
+# it can only reject correct ones, which is exactly what it did (e.g.
+# 74111 is listed at $492 under sections 23 and 25, so a request for OM,
+# OP or PE matched no row and came out "N/A" against a reference value of
+# $492; the same happened to ~300 SK rows).
+#
+# Reading the section *names* as specialty labels instead has the same
+# defect for the same reason, so that isn't the fix either -- with no
+# recognizable specialty column, SK's rows are simply unlabeled, and one
+# fee per code serves every sub-specialty, which is what the guide means.
 
 
 def _classify_specialty_cell(cell) -> str | None:
-    if isinstance(cell, (int, float)) and float(cell).is_integer():
-        return _NUMERIC_SPECIALTY_MARKERS.get(int(cell))
     if not isinstance(cell, str):
         return None
     return _ALL_SPECIALTY_MARKERS.get(cell.strip().upper())
@@ -2282,6 +2423,17 @@ def classify_file_specialty(path: Path, province: str | None = None) -> set[str]
 # covering GP, SP, *and* LTC together (e.g. "PE GP SP LTC Fee Guide") --
 # that file is a legitimate general SP source despite mentioning LTC, since
 # it isn't LTC-exclusive.
+#
+# A combined guide's name mentions GP *and* SP together (both markers must
+# be present, not just one) -- BC's own naming convention prefixes every one
+# of its per-sub-specialty SP guides with "SP" regardless of content (e.g.
+# "BC_SP_LTC_Fee_Guide_2025", "BC_SP_PA_Fee_Guide_2025"), so requiring only
+# one of the two markers made every BC LTC guide look like a legitimate
+# combined GP+SP guide from the bare word "SP" in its own folder-naming
+# convention, when it's actually an LTC-exclusive file with no GP content at
+# all. That let LTC-context rates leak in as the general/blanket SP fallback
+# for BC's other sub-specialties (EN, OS, PR, ...), which have no dedicated
+# guide of their own -- confirmed against BC's real LTC/PA/PE 2025 guides.
 _CONTEXT_RESTRICTED_MARKERS = ["LTC"]
 _COMBINED_GUIDE_MARKERS = ["GP", "SP"]
 
@@ -2294,8 +2446,103 @@ def _is_context_restricted(path: Path) -> bool:
     has_restricted_marker = any(re.search(rf"\b{marker}\b", name) for marker in _CONTEXT_RESTRICTED_MARKERS)
     if not has_restricted_marker:
         return False
-    is_combined_guide = any(re.search(rf"\b{marker}\b", name) for marker in _COMBINED_GUIDE_MARKERS)
+    is_combined_guide = all(re.search(rf"\b{marker}\b", name) for marker in _COMBINED_GUIDE_MARKERS)
     return not is_combined_guide
+
+
+@lru_cache(maxsize=None)
+def _cached_designates_specialties(path_str: str) -> bool:
+    path = Path(path_str)
+    suffix = path.suffix.lower()
+    try:
+        if suffix in SPREADSHEET_SUFFIXES:
+            # A workbook can designate by worksheet *title* instead of a
+            # per-row column (QC's combined SP guide splits sub-specialties
+            # into sheets named "Endodontie", "Parodontie", ...) -- that is
+            # what load_fees_from_spreadsheet keys off, so it counts here too.
+            titled = list(tables_from_spreadsheet_by_sheet(path))
+            if any(classify_sheet_specialty(title) for title, _, _ in titled):
+                return True
+            tables = [(h, r) for _t, h, r in titled]
+        elif suffix in CSV_SUFFIXES:
+            tables = list(tables_from_csv(path))
+        elif suffix in DOC_SUFFIXES:
+            tables = list(tables_from_docx(path))
+        else:
+            # A pdf is scanned as free text with no per-row structure at
+            # all, so it can never designate which specialty a fee belongs
+            # to.
+            return False
+    except Exception:
+        return False
+    return any(find_row_specialty_column(rows) is not None for _h, rows in tables)
+
+
+# A guide whose name declares it covers specialists generally ("SK SP Fee
+# Guide", "SK Specialist Fee Guide") IS designated -- as the province's
+# whole-of-SP schedule, quoting one specialist fee per code that applies to
+# every sub-specialty. That is a scope its own filename states, unlike a
+# file that names neither a sub-specialty nor SP at all (ON's
+# "ON_DA_Fee_Guide_2026", which reprints the province's entire schedule at
+# one unattributed set of rates and says nothing about who may bill it).
+_SPECIALIST_SCOPE_MARKERS = ["SP", "SPECIALIST", "SPECIALISTS", "SPECIALTY"]
+
+
+def declares_specialist_scope(path: Path) -> bool:
+    # "_"/"-" normalized to spaces first -- see classify_file_specialty.
+    name = path.stem.upper().replace("_", " ").replace("-", " ")
+    return any(re.search(rf"\b{m}\b", name) for m in _SPECIALIST_SCOPE_MARKERS)
+
+
+def is_declared_sp_source(path: Path) -> bool:
+    """True if `path` was explicitly listed in config.SP_EXTRA_GENERAL_SOURCES
+    as a legitimate specialist source. See that setting for why it exists."""
+    stem = path.stem.upper()
+    return any(frag.strip().upper() in stem
+               for frag in getattr(config, "SP_EXTRA_GENERAL_SOURCES", []) if frag.strip())
+
+
+def sp_source_decisions(specialty_dir: Path, province: str) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Which of a province's SP files may supply fees, and why the rest may not.
+
+    Returns (usable, [(path, reason_skipped), ...]). Split out from
+    load_pt_fees_by_subspecialty so a build can *report* the files it ignored:
+    a guide that is silently excluded looks exactly like a guide whose codes
+    aren't in the CDCP price file, and the difference matters when a code that
+    is plainly in a province's guide comes out "N/A".
+    """
+    usable, skipped = [], []
+    for f in discover_pt_files(specialty_dir, province):
+        if classify_file_specialty(f, province):
+            usable.append(f)
+        elif is_declared_sp_source(f):
+            usable.append(f)
+        elif _is_context_restricted(f):
+            skipped.append((f, "scoped to long-term care only, so not a general SP source"))
+        elif declares_specialist_scope(f) or designates_row_specialties(f):
+            usable.append(f)
+        else:
+            skipped.append((f, "names no sub-specialty, does not say SP/Specialist, and labels "
+                               "no row or sheet with a specialty -- add it to "
+                               "config.SP_EXTRA_GENERAL_SOURCES if it really is a specialist guide"))
+    return usable, skipped
+
+
+def designates_row_specialties(path: Path) -> bool:
+    """True if this file says, per row (or per worksheet), which specialty
+    each fee belongs to -- see find_row_specialty_column and
+    classify_sheet_specialty.
+
+    A file that says nothing about specialty anywhere, and isn't named for
+    one either, cannot supply a sub-specialty's fee: whatever rate it lists
+    is some single unattributed schedule, and handing it to a specialty it
+    never mentions is exactly the wrong-file substitution this guards
+    against. Confirmed against ON's guides -- ON_DA_Fee_Guide_2026 reprints
+    the province's entire schedule (1,386 codes) at one set of rates with no
+    specialty column and no specialty in its name, and was supplying fees
+    for OM, OP and RA, plus for PE/OS/PR/EN codes those specialties' own
+    guides don't list."""
+    return _cached_designates_specialties(str(path))
 
 
 # Some guides (so far only PE's combined GP+SP PDF) define a specialist's
@@ -2350,28 +2597,6 @@ def _multiplier_for_code(code: str, ranges: list[tuple[int, int, float]]) -> flo
     return None
 
 
-# Provinces where a code the sub-specialty's OWN guide doesn't list falls back
-# to the province's GP fee guide, per missing code rather than only when the
-# whole sub-specialty came up empty (see load_pt_fees_by_subspecialty's
-# docstring for why the all-or-nothing form is the default).
-#
-# This is the reference's own stated convention -- "For any SP code without SP
-# specific fee, GP fee is assumed" -- applied literally. Confirmed against
-# Ontario over 1115 flagged SP rows: 847 take the sub-specialty guide's own
-# value where that guide lists the code (so the guide must still win -- this
-# only ever fills gaps, never overrides), and 190 of the codes those guides
-# DON'T list match the ON GP guide's value exactly.
-#
-# Kept an explicit per-province opt-in rather than made global because the
-# default's caution is well-founded elsewhere: a sub-specialty with good
-# coverage and a few individually-unmatched codes is usually suffering an
-# extraction gap, and filling those from the GP guide would quietly replace
-# "N/A" with a plausible-looking wrong fee. Ontario is opted in because the
-# gap there is real (its specialty guides genuinely omit whole code ranges),
-# not an extraction artifact.
-SP_GP_GUIDE_FILLS_GAPS: set[str] = {"ON"}
-
-
 def load_pt_fees_by_subspecialty(
     specialty_dir: Path,
     province: str,
@@ -2385,38 +2610,41 @@ def load_pt_fees_by_subspecialty(
     are tried first for that sub-specialty's codes, before falling back to
     general/unspecific files (which is all load_pt_fees does on its own).
 
-    If `gp_specialty_dir` is given and a sub-specialty gets *no* matches at
-    all from SP sources (i.e. no PT guide covers that specialty for this
-    province -- e.g. BC has no EN/OM/OP/OS/PR/RA-specific guide), its codes
-    fall back to the province's GP fee guide instead -- the reference file's
-    own documented convention ("For any SP code without SP specific fee, GP
-    fee is assumed"). This is deliberately an all-or-nothing trigger per
-    sub-specialty, not a per-missing-code one: a sub-specialty with mostly
-    good SP-specific coverage and a few individually-unmatched codes is more
-    likely suffering an extraction gap in its own guide than a genuine
-    absence of specialty-specific pricing, and guessing the GP fee for those
-    stray gaps does more harm (contaminating otherwise-correct data) than
-    leaving them "N/A".
+    A code not found in SP sources is left unresolved -- written as "N/A"
+    by the sheet builders -- and is NOT back-filled from the province's GP
+    fee guide. A GP fee substituted for a missing specialist fee reads as a
+    real specialist rate in the output with nothing to distinguish it from
+    one, so a gap is reported honestly as a gap instead.
 
-    Before that blanket fallback, though, any codes covered by a documented
-    percentage-markup rule (see find_specialist_multiplier_ranges -- so far
-    only PE's guide) get GP fee x that specialty's stated multiplier
-    instead of the plain GP fee, since that's a known, precise rule rather
-    than a guess.
+    `gp_specialty_dir` is still used for one narrow case: a sub-specialty
+    whose own guide prices an entire code range as a documented percentage
+    markup over the GP fee rather than listing individual fees (see
+    find_specialist_multiplier_ranges -- so far only PE's guide, e.g.
+    "SERVICES PROVIDED BY A PROSTHODONTIST / SECTION 50000 - 59999 / FEES
+    FOR ALL CODES 20% HIGHER THAN FOR GENERAL PRACTITIONER'S SUGGESTED
+    FEE"). That is the SP guide stating its own prices in terms of the GP
+    schedule, not a fallback standing in for a fee it never gave -- the
+    resulting value is the specialist rate, not the GP one.
 
     Returns (fees dict keyed by (code, sub_specialty), sources_used, files found).
     """
     files = discover_pt_files(specialty_dir, province)
-    general_files = [f for f in files
-                      if not classify_file_specialty(f, province) and not _is_context_restricted(f)]
+    # A file not named for any one sub-specialty is usable only if it still
+    # declares who its fees are for: either its name says it is the
+    # province's specialist guide (see declares_specialist_scope) or it
+    # labels each row with the specialty that row belongs to (see
+    # designates_row_specialties). A file that does neither lists a single
+    # unattributed schedule, and lending that to a specialty it never names
+    # is the wrong-file substitution this function exists to avoid.
+    usable, _skipped = sp_source_decisions(specialty_dir, province)
+    general_files = [f for f in usable if not classify_file_specialty(f, province)]
 
     multiplier_ranges: dict[str, list[tuple[int, int, float]]] = {}
     for f in files:
         if f.suffix.lower() != ".pdf":
             continue
         try:
-            reader = pypdf.PdfReader(str(f))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            text = pdf_text(f)
         except Exception:
             continue
         for code, low, high, mult in find_specialist_multiplier_ranges(text):
@@ -2424,43 +2652,12 @@ def load_pt_fees_by_subspecialty(
 
     fees: dict[tuple[str, str], float] = {}
     sources_used: list[tuple[str, int]] = []
-
-    # For a province listed in SP_GP_GUIDE_FILLS_GAPS, the GP guide answers
-    # any code the sub-specialty's own guide doesn't list (see that
-    # constant). Loaded once for every sub-specialty's codes together rather
-    # than per sub-specialty, since the same file answers all of them and
-    # re-reading it ~10 times is pure waste.
-    gp_gap_fees: dict[str, float | str] = {}
-    if province in SP_GP_GUIDE_FILLS_GAPS and gp_specialty_dir is not None:
-        all_codes = set().union(*codes_by_subspecialty.values()) if codes_by_subspecialty else set()
-        if all_codes:
-            gp_gap_fees, gp_gap_sources, _ = load_pt_fees(
-                gp_specialty_dir, province, all_codes, verbose=False
-            )
-            sources_used.extend(
-                (f"{name} (GP guide, filling SP gaps)", n) for name, n in gp_gap_sources
-            )
     for sub_specialty, codes in codes_by_subspecialty.items():
         specific_files = [f for f in files if sub_specialty in classify_file_specialty(f, province)]
         candidate_files = specific_files + general_files if specific_files else general_files
         sub_fees, sub_sources = load_pt_fees_from_files(
             candidate_files, codes, verbose, target_specialty=sub_specialty
         )
-        # Gap-fill only -- never overrides a real fee the sub-specialty's own
-        # guide supplied, which stays authoritative. A no-fixed-fee marker
-        # ("I.C." etc.) counts as a gap rather than a value here: the guide
-        # is saying it has no set price for that code, so the GP guide's
-        # actual number is better information than passing the marker
-        # through (ON's OS guide prices 04314/04315 as "I.C." where the
-        # reference carries the GP guide's 114 / 109).
-        if gp_gap_fees:
-            for c in codes:
-                existing = sub_fees.get(c)
-                is_gap = existing is None or (
-                    isinstance(existing, str) and _NO_FEE_MARKER_RE.match(existing.strip())
-                )
-                if is_gap and c in gp_gap_fees:
-                    sub_fees[c] = gp_gap_fees[c]
         for code, fee in sub_fees.items():
             fees[(code, sub_specialty)] = fee
         sources_used.extend(sub_sources)
@@ -2495,12 +2692,12 @@ def load_pt_fees_by_subspecialty(
                 if applied:
                     sources_used.append((f"GP fee x specialist markup ({applied})", applied))
 
-        if not sub_fees and gp_specialty_dir is not None:
-            gp_fees, gp_sources, _ = load_pt_fees(gp_specialty_dir, province, codes, verbose=False)
-            for code, fee in gp_fees.items():
-                if (code, sub_specialty) not in fees:
-                    fees[(code, sub_specialty)] = fee
-            if gp_fees:
-                sources_used.extend((f"{label} (as GP fallback)", n) for label, n in gp_sources)
+        # NOTE: there is deliberately no GP fallback for codes still
+        # unmatched here. An SP code's fee comes from SP sources or not at
+        # all -- a code its own specialty's guide doesn't list is left
+        # unresolved, which the sheet builders write as "N/A" (see
+        # sp_row_values). Filling it with the province's GP fee instead
+        # produces a number that looks like a specialist rate but isn't one,
+        # and is indistinguishable in the output from a genuine SP match.
 
     return fees, sources_used, files

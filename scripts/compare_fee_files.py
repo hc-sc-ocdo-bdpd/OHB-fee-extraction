@@ -30,21 +30,40 @@ being labelled 'PT', column C holds the PT despite being labelled
 'Procedure Code') in both files. That layout is hardcoded below rather than
 trusted from the header text.
 
-Set GT_FILE and GEN_FILE below to the two workbook paths before running.
-Also writes a full mismatch/missing/extra report to an .xlsx file next to
-GT_FILE, in the same 'Output_2026 Fee Comparison' folder (see OUTPUT_FILE).
+Which year is compared comes from scripts/config.py (YEAR) -- both workbook
+paths and the '<year> CDCP Fee' / '<year> PT Fee' column labels derive from
+it, so no path or label in this file needs editing to run a different year.
+
+Usage:
+    python compare_fee_files.py                                    # uses config.YEAR
+    python compare_fee_files.py <ground_truth.xlsx> <generated.xlsx> [report.xlsx]
+
+Also writes a full mismatch/missing/extra report to an .xlsx file in that
+year's Fee Comparison folder (see config.mismatch_report).
 """
 
+import sys
 from pathlib import Path
 
 import openpyxl
 from openpyxl.styles import Font
 
-GT_FILE = Path(r"C:\Users\JOGILL\OneDrive - HC-SC PHAC-ASPC\Desktop\OHB\Data\Output_2026 Fee Comparison\2026 Fee Comparisons v2_updated.xlsx")
-GEN_FILE = Path(r"C:\Users\JOGILL\OneDrive - HC-SC PHAC-ASPC\Desktop\OHB\Data\Output_2026 Fee Comparison\2026 Fee Comparisons - generated.xlsx")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config
 
-# Written into the same "Output_2026 Fee Comparison" folder as GT_FILE.
-OUTPUT_FILE = GT_FILE.parent / "Fee_Comparison_Mismatches.xlsx"
+# All three paths follow config.YEAR -- change the year there, not here.
+# Override any of them for a one-off run without editing anything:
+#   python compare_fee_files.py [ground_truth.xlsx] [generated.xlsx] [report.xlsx]
+GT_FILE = config.ground_truth_workbook()
+GEN_FILE = config.output_workbook()
+OUTPUT_FILE = config.mismatch_report()
+
+# The workbook's own fee-column grouping labels, e.g. "2026 CDCP Fee" /
+# "2026 PT Fee". Year-derived (see config.fee_column_labels) -- these were
+# hardcoded to 2026, which against another year's workbook matched nothing
+# and produced an empty field list rather than an error. See the guard in
+# build_sheet_index.
+FEE_COLUMN_LABELS = config.fee_column_labels()
 
 SHEETS = ["GP", "QC GP", "SP", "QC SP", "DD", "DH"]
 
@@ -124,7 +143,7 @@ def build_sheet_index(sheet, sheet_name):
         # Two header rows: row 1 has the grouping label ('2026 CDCP Fee'),
         # row 2 has the sub-label ('Prof Fee' / 'Internal Lab Fee' / 'Combo Fee').
         group_row, sub_row, data_start = 1, 2, 3
-        groups = find_header_columns(sheet, group_row, {"2026 CDCP Fee", "2026 PT Fee"})
+        groups = find_header_columns(sheet, group_row, FEE_COLUMN_LABELS)
         field_columns = {}
         for group_name, start_col in groups.items():
             for offset, sub_label in enumerate(["Prof Fee", "Internal Lab Fee", "Combo Fee"]):
@@ -138,8 +157,21 @@ def build_sheet_index(sheet, sheet_name):
                 field_columns[f"{group_name} - {sub_label}"] = col
     else:
         data_start = 2
-        header_cols = find_header_columns(sheet, 1, {"2026 CDCP Fee", "2026 PT Fee"})
+        header_cols = find_header_columns(sheet, 1, FEE_COLUMN_LABELS)
         field_columns = {name: col for name, col in header_cols.items()}
+
+    # Nothing to compare means the header labels this script is looking for
+    # aren't in the workbook -- almost always a year mismatch (looking for
+    # "2026 PT Fee" in a 2025 workbook). Left unguarded that produced a
+    # clean run reporting a perfect match rate over zero fields, which is
+    # far worse than failing.
+    if not field_columns:
+        expected = "', '".join(sorted(FEE_COLUMN_LABELS))
+        raise ValueError(
+            f"{sheet_name}: none of the expected fee columns ('{expected}') were found "
+            f"in the header row. Check that config.YEAR ({config.YEAR}) matches the "
+            f"year these workbooks were built for."
+        )
 
     rows_by_key = {}
     for row in sheet.iter_rows(min_row=data_start):
@@ -267,8 +299,23 @@ def write_report(all_results, mismatches_by_sheet, missing_by_sheet, extra_by_sh
 
 
 def main():
-    gt_wb = openpyxl.load_workbook(GT_FILE, data_only=True)
-    gen_wb = openpyxl.load_workbook(GEN_FILE, data_only=True)
+    gt_file = Path(sys.argv[1]) if len(sys.argv) >= 2 else GT_FILE
+    gen_file = Path(sys.argv[2]) if len(sys.argv) >= 3 else GEN_FILE
+    output_file = Path(sys.argv[3]) if len(sys.argv) >= 4 else OUTPUT_FILE
+
+    # Printed up front so a wrong year or a stale path is obvious before the
+    # match rates scroll past.
+    print(f"Comparing {config.YEAR} Fee Comparison workbooks")
+    print(f"  Ground truth : {gt_file}")
+    print(f"  Generated    : {gen_file}")
+    print(f"  Report       : {output_file}")
+    for label, path in (("Ground truth", gt_file), ("Generated", gen_file)):
+        if not path.exists():
+            raise SystemExit(f"ERROR: {label} workbook not found: {path}")
+    print()
+
+    gt_wb = openpyxl.load_workbook(gt_file, data_only=True)
+    gen_wb = openpyxl.load_workbook(gen_file, data_only=True)
 
     all_results = []
     mismatches_by_sheet = {}
@@ -302,8 +349,9 @@ def main():
     print(f"{'OVERALL':<8} {'':<28} {total_all:>7} {matched_all:>8} "
           f"{total_all - matched_all:>9} {'':>16} {overall_rate:>7.2f}%")
 
-    write_report(all_results, mismatches_by_sheet, missing_by_sheet, extra_by_sheet, OUTPUT_FILE)
-    print(f"\nFull mismatch/missing/extra report written to: {OUTPUT_FILE}")
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    write_report(all_results, mismatches_by_sheet, missing_by_sheet, extra_by_sheet, output_file)
+    print(f"\nFull mismatch/missing/extra report written to: {output_file}")
 
 
 if __name__ == "__main__":
