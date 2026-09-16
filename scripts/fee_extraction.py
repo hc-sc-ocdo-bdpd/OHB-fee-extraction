@@ -184,6 +184,23 @@ def extract_max_dollar(value) -> float | None:
     return max(numbers) if numbers else None
 
 
+# No dental procedure fee in these guides comes close to this. The largest
+# genuine one seen across every province is about $7,500 (NS's 51603), so a
+# six-figure "fee" is always a parsing artifact rather than a real price --
+# most often the French space-grouped thousands pattern gluing several
+# unrelated adjacent numbers into one (QC GP's 21223 came out as 1,888,377
+# against a reference of 255; "255 188 837" reads the same way).
+#
+# Such a value is *discarded* rather than used, which lets the next candidate
+# in the row -- or the next source file -- supply the real fee instead of the
+# artifact winning simply by being found first.
+_MAX_PLAUSIBLE_FEE = 100_000
+
+
+def _is_plausible_fee(value) -> bool:
+    return not isinstance(value, (int, float)) or abs(float(value)) <= _MAX_PLAUSIBLE_FEE
+
+
 def _fee_candidates(cell) -> list[float]:
     """Fee candidates for one non-code cell. Real numeric cells (the normal
     case for a spreadsheet fee column) are always trusted. For text cells,
@@ -243,11 +260,16 @@ def _fee_candidates(cell) -> list[float]:
             value = float(digits)
         except ValueError:
             continue
-        if "." not in token and value < 10 and not whole_cell_number:
+        # ...but zero is never a fee, however it's written. A lone "0" in a
+        # fee column is a placeholder for "nothing here", and letting the
+        # whole-cell rule above rescue it turns an unpriced code into a
+        # confident $0 (confirmed on QC GP 23114/23115, which came out 0
+        # against a reference of 410).
+        if "." not in token and value < 10 and not (whole_cell_number and value > 0):
             continue
         matches.append((m.start(), value))
     matches.sort(key=lambda t: t[0])
-    return [v for _, v in matches]
+    return [v for _, v in matches if _is_plausible_fee(v)]
 
 
 # Column headers containing one of these words are treated as a "fee"
@@ -464,7 +486,17 @@ def extract_codes_from_rows(
                     other_cells = [cell for j, cell in enumerate(cells) if j not in exclude_indices]
 
                 fee = None
-                numeric_candidates = [float(c) for c in other_cells if isinstance(c, (int, float))]
+                # Zero is never a fee, so a numeric 0 is not a candidate --
+                # matching how a text "0" is treated (see _fee_candidates).
+                # Several guides carry a trailing all-zero column after the
+                # real fee (MB's per-specialty guides are laid out
+                # "code | code-as-text | description | fee | 0"), and since
+                # the rightmost candidate wins that 0 silently beat the fee
+                # for every row that had one -- MB EN's 01204 came out 0
+                # against a reference of 108.50, along with ~75 other codes.
+                numeric_candidates = [float(c) for c in other_cells
+                                      if isinstance(c, (int, float))
+                                      and c != 0 and _is_plausible_fee(c)]
                 # A bare fraction (0 < v < 1) is never a dental fee -- it's a
                 # ratio/percentage column the guide happens to carry. Since
                 # the rightmost candidate wins, such a column silently beats
@@ -1026,6 +1058,34 @@ _LAYOUT_SEGMENT_SEARCH_WINDOW = 3000
 
 _YEAR_RE = re.compile(r"^(19|20)\d{2}$")
 
+
+def _looks_like_year(text: str) -> bool:
+    """True if `text` is a 4-digit year, including when it has been rendered
+    as a currency amount.
+
+    A guide built from a spreadsheet can export a year cell with number
+    formatting applied, so the year arrives as "2,024.00" rather than "2024"
+    -- confirmed in NL's DH guide, where a lone "2,024.00" (the only
+    comma-thousands token in all 18 pages, sitting detached at the foot of a
+    page with no code near it) was taken as code 00112's fee against a
+    reference of 128.74. A bare "2024" was already excluded; this closes the
+    formatted variant.
+
+    Only an exact whole-dollar amount is treated as a year: "2,024.00" is,
+    "2,024.75" isn't, so a genuine fee that merely starts with a year-like
+    figure keeps its cents and is still read as a fee.
+
+    Internal spaces are deliberately NOT stripped. A real year is written as
+    four digits with nothing between them, whereas French-Canadian amounts
+    space-group their thousands -- "1 970 $" is nineteen hundred and seventy
+    dollars, not the year 1970. Collapsing that space made QC GP's 34115
+    (fee "1 970 $") read as a year, which dropped it to the bare-number tier
+    and returned 970; "1 261" and "1 509 $" would have gone the same way."""
+    cleaned = text.strip().replace("$", "").replace(",", "").strip()
+    if cleaned.endswith(".00"):
+        cleaned = cleaned[:-3]
+    return bool(_YEAR_RE.match(cleaned))
+
 # A page-number token ("PAGE 9") immediately preceding a bare number in a
 # segment -- seen when a code is the last one on its page, so its segment
 # runs on into the next page's header/footer noise (a recurring "Table of
@@ -1035,6 +1095,30 @@ _YEAR_RE = re.compile(r"^(19|20)\d{2}$")
 # that came right before it -- e.g. "...Minimum of 14 images 150\n...PAGE
 # 9..." resolved to 9 instead of 150.
 _PRECEDED_BY_PAGE_RE = re.compile(r"PAGE\s*$", re.IGNORECASE)
+
+# A bare number followed, ON THE SAME LINE, by a 5-digit code is that code's
+# row number, not the previous code's fee. QC's guide opens with a
+# "MODIFICATIONS AU GUIDE" amendments table laid out as
+# "Page | Code | Légende | Tarif", whose rows read:
+#
+#     145 80672  Ablation d'un fil de rétention orthodontique, par dent
+#     154 83113  Appareil de rétention de type gouttière (acrylique)...
+#
+# so 80672's segment ends with "154 " -- the page number belonging to the
+# NEXT row -- and the risky bare-whole-number fallback tier takes it as
+# 80672's fee (confirmed: 80672 resolved to 154 against a reference of 62,
+# and 27150 to 145 the same way). Because that first occurrence "resolved"
+# something, extract_codes_from_text locked the code in and the code's real
+# entry later in the guide never got a chance.
+#
+# Detected via the segment's own end rather than by looking for the code:
+# extract_codes_from_text cuts each segment immediately BEFORE the next code,
+# so a trailing number with nothing but spaces after it is one the next code
+# shares a line with. Anchored on the absence of a newline deliberately -- a
+# guide that genuinely uses the bare-number tier prints the fee at the END of
+# its row ("00211 1 image 46") with the next code starting a new line, so
+# those keep working untouched.
+_TRAILING_ROW_NUMBER_RE = re.compile(r"[ \t]*")
 
 
 def _fee_token_in_segment(segment: str, window_size: int = _SEGMENT_SEARCH_WINDOW) -> tuple[float | str | None, bool]:
@@ -1063,7 +1147,7 @@ def _fee_token_in_segment(segment: str, window_size: int = _SEGMENT_SEARCH_WINDO
         last_valid = None
         for match in pattern.finditer(window):
             text = match.group(0)
-            if _YEAR_RE.match(text.strip()):
+            if _looks_like_year(text):
                 continue
             last_valid = text
         if last_valid is not None:
@@ -1073,15 +1157,26 @@ def _fee_token_in_segment(segment: str, window_size: int = _SEGMENT_SEARCH_WINDO
             # running total, which is what the reference treats as the
             # code's fee -- and it's harmless when there's only one match,
             # since first and last are then the same token.
-            return parser(last_valid), True
+            parsed = parser(last_valid)
+            # An implausible amount means this tier misread the text (see
+            # _MAX_PLAUSIBLE_FEE); fall through to the next tier rather than
+            # locking the code to an artifact.
+            if _is_plausible_fee(parsed):
+                return parsed, True
 
     bare_pattern, bare_parser = _BARE_NUMBER_TIER
     last_valid = None
     for match in bare_pattern.finditer(window):
         text = match.group(0)
-        if _YEAR_RE.match(text.strip()):
+        if _looks_like_year(text):
             continue
         if _PRECEDED_BY_PAGE_RE.search(window[:match.start()]):
+            continue
+        # The next row's page/row number, not this code's fee -- see
+        # _TRAILING_ROW_NUMBER_RE. A segment ends immediately before the next
+        # code, so "nothing but spaces after this number" means that next code
+        # sits on the SAME line as it, which is the amendments-table shape.
+        if _TRAILING_ROW_NUMBER_RE.fullmatch(segment[match.end():]):
             continue
         last_valid = text
     if last_valid is not None:
@@ -1313,7 +1408,7 @@ def load_fees_from_abbreviated_pdf(path: Path, known_codes: set[str]) -> dict[st
             # stray running-header/footer year label like "2026" (starts
             # with a digit but is exactly a bare year, same exclusion
             # _fee_token_in_segment already applies elsewhere).
-            if line and re.match(r"^\d", line) and not _YEAR_RE.match(line)
+            if line and re.match(r"^\d", line) and not _looks_like_year(line)
         ]
         if len(fee_lines) != len(codes_in_order):
             continue
