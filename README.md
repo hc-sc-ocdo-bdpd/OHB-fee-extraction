@@ -181,6 +181,19 @@ gap is shown as a gap on purpose, so nothing invented reaches the output.
 Rows are the union of both years, so a code the CDCP only started listing in
 the newer year still appears, with the older year shown for comparison.
 
+## Known gaps
+
+These are deliberate, and unchanged from previous builds:
+
+- **Claim counts are written as `0`.** The CDCP files don't carry claim
+  counts. The weighting formulas are written and ready, so dropping real
+  counts in later makes the workbook calculate correctly with no code change.
+- **QC GP / QC SP fee columns are plain numbers, not formulas.** The template
+  had formulas pointing at linked workbooks we don't have; those are replaced
+  with the extracted values.
+- **GP's last column** was already a broken `#REF!` in the template. It is
+  replaced with a working equivalent.
+
 ## If something goes wrong
 
 | What you see | What to do |
@@ -246,3 +259,63 @@ Both are in `config.py`, with fuller notes beside them:
   specialist schedule isn't named to that convention, list it here to allow
   it. Leave empty unless a specialist province comes out entirely `N/A`
   despite having a guide.
+
+---
+
+# Appendix — Running this in Microsoft Fabric
+
+Optional. The build runs fine on a laptop; this is only if you want it to
+live in Fabric alongside your other data work.
+
+## What changes
+
+Almost nothing. This is ordinary Python reading files from folders — no
+database, no cluster. Fabric supplies the folders and a place to run it.
+
+| On a laptop | In Fabric |
+|---|---|
+| The `Data` folder | **Lakehouse → Files**, same folder layout |
+| Running `build_fee_comparison.py` | A **Python notebook** |
+| Installing from `requirements.txt` | A Fabric **Environment** holding the same four libraries |
+| Opening the output folder | **OneLake File Explorer**, which syncs to Windows Explorer |
+
+## How the move works
+
+1. **Upload `Data/` to the Lakehouse's `Files` area**, keeping the folder
+   layout in Step 2 exactly as it is. Drag and drop works.
+2. **Upload the `scripts` folder** to `Files/code/`.
+3. **Create an Environment** with `openpyxl`, `pypdf`, `xlrd` and
+   `python-docx`, and attach it to the notebook. All four are plain Python
+   packages, so nothing needs compiling.
+4. **Create a Python notebook** with this in it:
+
+   ```python
+   import os, sys
+   os.environ["OHB_DATA_DIR"] = "/lakehouse/default/Files/Data"
+   sys.path.insert(0, "/lakehouse/default/Files/code")
+
+   from build_fee_comparison import main
+   main()
+   ```
+
+   No change to any script. The data folder was always a setting.
+5. **Run it.** The finished workbook appears in
+   `Files/Data/<year>/<year>_Output/`, same as on a laptop.
+
+Optionally wrap the notebook in a **Data Pipeline** so it can be started with
+one click, or on a schedule.
+
+## Three things to tell whoever sets it up
+
+- **Use a Python notebook, not a Spark one.** Fabric offers Spark by default.
+  This workload is a few hundred files read one after another on a single
+  machine — Spark adds startup time and cost and makes it no faster.
+- **Write the workbook locally first, then copy it.** Saving a styled Excel
+  file directly onto the Lakehouse mount can be unreliable. Save to a
+  temporary local path and copy it across at the end.
+- **Settle the data-sensitivity and capacity-region questions first.** These
+  are departmental decisions, not technical ones, and far cheaper to answer
+  before the files are uploaded than after.
+
+Fabric changes often, so check current Microsoft documentation for the exact
+menu names and runtime versions.
