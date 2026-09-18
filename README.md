@@ -213,7 +213,6 @@ can be repeated if the extraction logic is ever changed.
 | `compare_fee_files.py` | Compares generated output against the ground-truth workbook and writes a mismatch report. |
 | `highlight_matching_mismatches.py` | Carries "reviewed / accepted" green highlights from one mismatch report to the next. |
 | `trace_fee_source.py` | For one code, shows which guide file supplied its fee and what every other file would have said. Useful for investigating a single surprising number. |
-| `DH Full PDF Data Extraction (except qc) - demo.py` | An early standalone demo of PDF extraction. Superseded. |
 
 Running any of these is optional and affects nothing. They never modify the
 generated workbook.
