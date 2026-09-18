@@ -304,18 +304,3 @@ database, no cluster. Fabric supplies the folders and a place to run it.
 
 Optionally wrap the notebook in a **Data Pipeline** so it can be started with
 one click, or on a schedule.
-
-## Three things to tell whoever sets it up
-
-- **Use a Python notebook, not a Spark one.** Fabric offers Spark by default.
-  This workload is a few hundred files read one after another on a single
-  machine — Spark adds startup time and cost and makes it no faster.
-- **Write the workbook locally first, then copy it.** Saving a styled Excel
-  file directly onto the Lakehouse mount can be unreliable. Save to a
-  temporary local path and copy it across at the end.
-- **Settle the data-sensitivity and capacity-region questions first.** These
-  are departmental decisions, not technical ones, and far cheaper to answer
-  before the files are uploaded than after.
-
-Fabric changes often, so check current Microsoft documentation for the exact
-menu names and runtime versions.
