@@ -11,7 +11,7 @@ Cols:  2025 CDCP Fee | 2026 CDCP Fee | 2025 PT Fee | 2026 PT Fee
 ```
 
 It reads the CDCP price files and the provincial fee guides (Excel, CSV, Word
-or PDF) and writes the finished workbook. Nothing is typed in by hand.
+or PDF) and writes the finished workbook. 
 
 ---
 
