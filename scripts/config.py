@@ -1,9 +1,10 @@
 """
-Single place to configure which rate year the whole pipeline runs against.
+Single place to configure which pair of rate years the whole pipeline runs
+against.
 
-Change `YEAR` below and nothing else -- every folder path, input filename
-pattern, output filename, and the prior-year column filter in
-fee_extraction all derive from it.
+Change `PAST_YEAR` and `CURRENT_YEAR` below and nothing else -- every folder
+path, input filename pattern, output filename, header label, and the
+prior-year column filter in fee_extraction all derive from them.
 
 Expected layout (the convention actually in use):
 

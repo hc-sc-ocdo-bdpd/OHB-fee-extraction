@@ -257,7 +257,6 @@ def main(argv=None) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb_new.save(output_path)
     print(f"\nSaved {output_path}  ({total} rows across {len(SHEETS)} sheets)")
-    print("Run compare_fee_files.py to check this output against the ground truth.")
 
 
 if __name__ == "__main__":
