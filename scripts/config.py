@@ -29,21 +29,30 @@ import re
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# THE ONE KNOB: which rate year's DATA gets populated. One year at a time.
+# THE TWO KNOBS: the pair of rate years the output carries, side by side.
+#
+# Both are populated from their own year's data folders -- PAST_YEAR fills the
+# "<year> CDCP Fee"/"<year> PT Fee" columns on the left, CURRENT_YEAR the ones
+# on the right. To build a different pair next time, change these two numbers
+# and nothing else; every folder, filename, header label and output path is
+# derived from them (see year_dir, cdcp_dir, pt_guides_dir, output_dir).
+#
+# They do not have to be consecutive, and a pair may be built before one
+# year's guides have arrived -- a year with no data folder simply comes out
+# "N/A" in its columns rather than failing the build.
 # ---------------------------------------------------------------------------
-YEAR = 2026
+PAST_YEAR = 2025
+CURRENT_YEAR = 2026
 # ---------------------------------------------------------------------------
 
-# The output workbook carries TWO years of fee columns side by side (a prior
-# year and a current one), because the reference workbook it mirrors does.
-# These control the year *labels* written into the header rows; YEAR above
-# still decides which year's data is actually populated.
-#
-# Left as None they follow YEAR (past = YEAR - 1, current = YEAR), which is
-# the normal case. Set them explicitly only if a build needs a pairing that
-# isn't simply "last year and this year".
-PAST_YEAR = None
-CURRENT_YEAR = None
+# Which of the two years a load is currently working on. Set by
+# fee_dataset.year_context() for the duration of one year's extraction, and
+# read by _y() below so that year-derived lookups -- CDCP price filenames in
+# particular -- resolve to the year being read rather than to a fixed one.
+# This is what lets cdcp_loader and fee_extraction stay exactly as they are
+# while the build walks two years: they ask config for "the" year, and config
+# answers with whichever year is being loaded right now.
+_ACTIVE_YEAR: int | None = None
 
 # The template workbook supplies the header rows, styling, column layout and
 # the Claim Lines sheet that the generated output is built on. It is the SAME
@@ -62,13 +71,24 @@ REQUIRED_TEMPLATE_SHEETS = ("Claim Lines", "DH", "GP", "QC GP", "SP", "QC SP", "
 
 
 def past_year(year: int = None) -> int:
-    y = _y(year)
-    return (y - 1) if PAST_YEAR is None else PAST_YEAR
+    return PAST_YEAR
 
 
 def current_year(year: int = None) -> int:
-    y = _y(year)
-    return y if CURRENT_YEAR is None else CURRENT_YEAR
+    return CURRENT_YEAR
+
+
+def years() -> tuple[int, int]:
+    """The two years this build populates, oldest first."""
+    return (PAST_YEAR, CURRENT_YEAR)
+
+
+def set_active_year(year: int | None) -> int | None:
+    """Point year-derived lookups at `year`; returns the previous setting so
+    a caller can restore it. Prefer fee_dataset.year_context()."""
+    global _ACTIVE_YEAR
+    previous, _ACTIVE_YEAR = _ACTIVE_YEAR, year
+    return previous
 
 # Root that holds the per-year folders. Defaults to "Data" beside this repo
 # (i.e. <repo parent>/Data). Override without editing this file by setting the
@@ -81,7 +101,22 @@ DATA_DIR = Path(os.environ.get("OHB_DATA_DIR") or (BASE_DIR / "Data"))
 
 
 def _y(year: int | None) -> int:
-    return YEAR if year is None else year
+    """Resolve an optional year argument.
+
+    An explicit year always wins. Otherwise it's the year currently being
+    loaded (see _ACTIVE_YEAR), and failing that the current year -- so a
+    caller that never mentions a year still behaves sensibly."""
+    if year is not None:
+        return year
+    return _ACTIVE_YEAR if _ACTIVE_YEAR is not None else CURRENT_YEAR
+
+
+# Backwards-compatible alias. Modules that predate the two-year build ask for
+# config.YEAR; it now means "the year being loaded, else the current one".
+def __getattr__(name):
+    if name == "YEAR":
+        return _y(None)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def year_dir(year: int = None) -> Path:
@@ -201,6 +236,22 @@ def available_years() -> list[int]:
     return sorted(years, reverse=True)
 
 
+def templates_dir() -> Path:
+    """Folder holding the workbook template, outside any per-year folder.
+
+    The template is the same file for every year -- only its header year
+    labels are rewritten -- so it doesn't belong to 2025 or 2026 and is
+    better kept somewhere deliberate than picked out of a year's output
+    folder alongside generated workbooks. This folder is searched FIRST, so
+    a template put here always wins over one found anywhere else.
+    """
+    return _first_existing([
+        DATA_DIR / "templates",
+        DATA_DIR / "Templates",
+        DATA_DIR / "_templates",
+    ])
+
+
 def _template_names(y: int) -> list[str]:
     return [
         f"{y} Fee Comparisons v2.xlsx",
@@ -253,7 +304,17 @@ def template_candidates(year: int = None) -> list[Path]:
     """
     y = _y(year)
     d = output_dir(y)
+    td = templates_dir()
     candidates: list[Path] = []
+
+    # 0. A template kept deliberately in <Data>/templates wins over anything
+    #    else, under ANY filename: putting a workbook there is the whole
+    #    instruction. Conventional names first purely so a folder holding
+    #    several files picks the obvious one; every candidate is still
+    #    sheet-validated before it is accepted.
+    candidates += [td / n for n in _SHARED_TEMPLATE_NAMES]
+    candidates += [td / n for n in _template_names(y)]
+    candidates += _plausible_template_files(td, set(candidates))
 
     # 1. This year's own combined workbook, by conventional name.
     candidates += [d / n for n in _template_names(y)]
@@ -269,7 +330,9 @@ def template_candidates(year: int = None) -> list[Path]:
         od = output_dir(other)
         candidates += [od / n for n in _template_names(other)]
         candidates += [od / n for n in _SHARED_TEMPLATE_NAMES]
-    # 4. Last resort: any other plausible workbook, this year's folder first.
+    # 4. Last resort: any other plausible workbook -- this year's output
+    #    folder, then the other years'. (The templates folder is already
+    #    fully covered by step 0.)
     seen = set(candidates)
     extras = _plausible_template_files(d, seen)
     seen.update(extras)
@@ -352,6 +415,13 @@ def ground_truth_workbook(year: int = None) -> Path:
     for other in available_years():
         if other != y:
             candidates += [output_dir(other) / n for n in _gt_names(other)]
+    # Last: the templates folder. Moving the combined workbook there (rather
+    # than copying it) would otherwise leave compare_fee_files with no
+    # reference at all -- the template and the ground truth are often the
+    # same file, differing only in whether the fee columns are filled in.
+    td = templates_dir()
+    candidates += [td / n for n in _gt_names(y)]
+    candidates += _plausible_template_files(td, set(candidates))
     # Validated like the template: a per-specialty extract that merely
     # matched the name pattern isn't a usable reference workbook.
     for candidate in candidates:
@@ -372,12 +442,17 @@ def mismatch_master(year: int = None) -> Path:
 
 
 def fee_column_labels(year: int = None) -> set[str]:
-    """The two grouping labels in a Fee Comparison workbook's header row
-    ("2026 CDCP Fee" / "2026 PT Fee"). Year-derived: hardcoded at 2026 these
-    silently match nothing in another year's workbook, which reads as zero
-    comparable fields rather than as an error."""
-    y = _y(year)
-    return {f"{y} CDCP Fee", f"{y} PT Fee"}
+    """The fee-column grouping labels in a Fee Comparison workbook's header.
+
+    With no year given this covers BOTH years the build populates, so a
+    comparison checks every fee column in the workbook rather than half of
+    them. Pass a year to get just that year's pair."""
+    if year is not None:
+        return {f"{year} CDCP Fee", f"{year} PT Fee"}
+    labels = set()
+    for y in years():
+        labels |= {f"{y} CDCP Fee", f"{y} PT Fee"}
+    return labels
 
 
 # Filename fragments (case-insensitive, matched against the file's stem) that

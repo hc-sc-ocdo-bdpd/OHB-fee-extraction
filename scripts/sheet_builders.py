@@ -98,16 +98,28 @@ def _style_row_cells(template_ws, style_row: int, num_cols: int) -> dict[int, ob
 NA = "N/A"
 
 
-def dh_row_values(r: int, province: str, code: str, cdcp_2026, pt_2026) -> list:
+def _fee(value):
+    """A fee cell: the number, or "N/A" when that year has none.
+
+    Both years go through this, so a code priced in only one of them shows
+    its value on one side and "N/A" on the other -- which is the comparison
+    the workbook exists to make."""
+    return NA if value is None else value
+
+
+def dh_row_values(r: int, province: str, code: str, cdcp: tuple, pt: tuple) -> list:
+    """cdcp/pt are (past_year_value, current_year_value) pairs."""
+    cdcp_past, cdcp_current = cdcp
+    pt_past, pt_current = pt
     return [
         code,                                                 # A Procedure Code
         "DH",                                                 # B Specialty
         province,                                             # C PT
         f"=A{r}&C{r}&B{r}",                                   # D Helper
-        NA,                                                   # E 2025 CDCP Fee
-        cdcp_2026 if cdcp_2026 is not None else NA,           # F 2026 CDCP Fee
-        NA,                                                   # G 2025 PT Fee
-        pt_2026 if pt_2026 is not None else NA,               # H 2026 PT Fee
+        _fee(cdcp_past),                                      # E past CDCP Fee
+        _fee(cdcp_current),                                   # F current CDCP Fee
+        _fee(pt_past),                                        # G past PT Fee
+        _fee(pt_current),                                     # H current PT Fee
         f'=IFERROR((F{r}-E{r})/E{r},"N/A")',                  # I Unweighted Increase in CDCP Fees
         f'=IFERROR((H{r}-G{r})/G{r},"N/A")',                  # J Unweighted Increase in PT Fees
         f'=IFERROR(F{r}/H{r},"N/A")',                         # K Unweighted CDCP/PT 2026
@@ -129,29 +141,32 @@ def dh_row_values(r: int, province: str, code: str, cdcp_2026, pt_2026) -> list:
 
 
 def build_dh_sheet(wb_new, template_ws, rows: list[tuple[str, str, float | None, float | None]]):
-    """rows: list of (province, code, cdcp_2026, pt_2026)."""
+    """rows: list of (province, code, cdcp_pair, pt_pair)."""
     num_cols = 25
     ws = wb_new.create_sheet("DH")
     copy_header_rows(ws, template_ws, num_header_rows=1, num_cols=num_cols)
     style_cells = _style_row_cells(template_ws, style_row=2, num_cols=num_cols)
 
     r = 2
-    for province, code, cdcp_2026, pt_2026 in rows:
-        write_row(ws, r, dh_row_values(r, province, code, cdcp_2026, pt_2026), style_cells)
+    for province, code, cdcp, pt in rows:
+        write_row(ws, r, dh_row_values(r, province, code, cdcp, pt), style_cells)
         r += 1
 
 
-def gp_row_values(r: int, province: str, code: str, cdcp_2026, pt_2026) -> list:
+def gp_row_values(r: int, province: str, code: str, cdcp: tuple, pt: tuple) -> list:
+    """cdcp/pt are (past_year_value, current_year_value) pairs."""
+    cdcp_past, cdcp_current = cdcp
+    pt_past, pt_current = pt
     return [
         province,                                          # A PT
         "GP",                                               # B Specialty
         code,                                                # C Procedure Code
         f"=C{r}&A{r}",                                       # D Column2 (helper)
         f"=C{r}&A{r}&B{r}",                                  # E Column1 (helper)
-        NA,                                                  # F 2025 CDCP Fee
-        cdcp_2026 if cdcp_2026 is not None else NA,          # G 2026 CDCP Fee
-        NA,                                                  # H 2025 PT Fee
-        pt_2026 if pt_2026 is not None else NA,              # I 2026 PT Fee
+        _fee(cdcp_past),                                     # F past CDCP Fee
+        _fee(cdcp_current),                                  # G current CDCP Fee
+        _fee(pt_past),                                       # H past PT Fee
+        _fee(pt_current),                                    # I current PT Fee
         f'=IFERROR((G{r}-F{r})/F{r},"N/A")',                 # J Unweighted Increase in CDCP Fees
         f'=IFERROR(G{r}/I{r},"N/A")',                        # K Unweighted CDCP/PT 2026
         0,                                                    # L CDCP Claims for CDCP Fee Growth
@@ -168,28 +183,31 @@ def gp_row_values(r: int, province: str, code: str, cdcp_2026, pt_2026) -> list:
 
 
 def build_gp_sheet(wb_new, template_ws, rows: list[tuple[str, str, float | None]]):
-    """rows: list of (province, code, cdcp_2026, pt_2026) tuples, excluding QC."""
+    """rows: list of (province, code, cdcp_pair, pt_pair), excluding QC."""
     num_cols = 21
     ws = wb_new.create_sheet("GP")
     copy_header_rows(ws, template_ws, num_header_rows=1, num_cols=num_cols)
     style_cells = _style_row_cells(template_ws, style_row=2, num_cols=num_cols)
 
     r = 2
-    for province, code, cdcp_2026, pt_2026 in rows:
-        write_row(ws, r, gp_row_values(r, province, code, cdcp_2026, pt_2026), style_cells)
+    for province, code, cdcp, pt in rows:
+        write_row(ws, r, gp_row_values(r, province, code, cdcp, pt), style_cells)
         r += 1
 
 
-def qc_gp_row_values(r: int, code: str, cdcp_2026, pt_2026) -> list:
+def qc_gp_row_values(r: int, code: str, cdcp: tuple, pt: tuple) -> list:
+    """cdcp/pt are (past_year_value, current_year_value) pairs."""
+    cdcp_past, cdcp_current = cdcp
+    pt_past, pt_current = pt
     return [
         "QC",                                                # A PT
         "GP",                                                # B Specialty
         code,                                                # C Procedure Code
         f"=C{r}&A{r}&B{r}",                                  # D helper
-        NA,                                                  # E 2025 CDCP Fee
-        cdcp_2026 if cdcp_2026 is not None else NA,          # F 2026 CDCP Fee (was external-workbook VLOOKUP)
-        NA,                                                  # G 2025 PT Fee (was external-workbook VLOOKUP)
-        pt_2026 if pt_2026 is not None else NA,              # H 2026 PT Fee
+        _fee(cdcp_past),                                     # E past CDCP Fee
+        _fee(cdcp_current),                                  # F current CDCP Fee (was external-workbook VLOOKUP)
+        _fee(pt_past),                                       # G past PT Fee (was external-workbook VLOOKUP)
+        _fee(pt_current),                                    # H current PT Fee
         f'=IFERROR((F{r}-E{r})/E{r},"N/A")',                 # I Unweighted Increase in CDCP Fees
         f'=IFERROR(F{r}/H{r},"N/A")',                        # J Unweighted CDCP/PT 2026
         0,                                                    # K CDCP Claim Lines
@@ -210,29 +228,33 @@ def qc_gp_row_values(r: int, code: str, cdcp_2026, pt_2026) -> list:
 
 
 def build_qc_gp_sheet(wb_new, template_ws, rows: list[tuple[str, float | None]]):
-    """rows: list of (code, cdcp_2026, pt_2026) tuples for QC only."""
+    """rows: list of (code, cdcp_pair, pt_pair) for QC only."""
     num_cols = 24
     ws = wb_new.create_sheet("QC GP")
     copy_header_rows(ws, template_ws, num_header_rows=1, num_cols=num_cols)
     style_cells = _style_row_cells(template_ws, style_row=2, num_cols=num_cols)
 
     r = 2
-    for code, cdcp_2026, pt_2026 in rows:
-        write_row(ws, r, qc_gp_row_values(r, code, cdcp_2026, pt_2026), style_cells)
+    for code, cdcp, pt in rows:
+        write_row(ws, r, qc_gp_row_values(r, code, cdcp, pt), style_cells)
         r += 1
 
 
-def sp_row_values(r: int, province: str, sub_specialty: str, code: str, cdcp_2026, pt_2026) -> list:
+def sp_row_values(r: int, province: str, sub_specialty: str, code: str,
+                  cdcp: tuple, pt: tuple) -> list:
+    """cdcp/pt are (past_year_value, current_year_value) pairs."""
+    cdcp_past, cdcp_current = cdcp
+    pt_past, pt_current = pt
     return [
         province,                                            # A Province
         sub_specialty,                                       # B Specialty
         code,                                                 # C Procedure Code
         f"=C{r}&A{r}",                                        # D helper
         f"=D{r}&B{r}",                                        # E Concat
-        NA,                                                   # F 2025 CDCP Fee
-        cdcp_2026 if cdcp_2026 is not None else NA,           # G 2026 CDCP Fee
-        NA,                                                   # H 2025 PT Fee
-        pt_2026 if pt_2026 is not None else NA,               # I 2026 PT Fee
+        _fee(cdcp_past),                                      # F past CDCP Fee
+        _fee(cdcp_current),                                   # G current CDCP Fee
+        _fee(pt_past),                                        # H past PT Fee
+        _fee(pt_current),                                     # I current PT Fee
         f'=IFERROR((G{r}-F{r})/F{r},"N/A")',                  # J Unweighted Increase in CDCP Fees
         f'=IFERROR(G{r}/I{r},"")',                            # K Unweighted CDCP/PT 2026
         0,                                                     # L CDCP Claim Weight
@@ -246,29 +268,32 @@ def sp_row_values(r: int, province: str, sub_specialty: str, code: str, cdcp_202
 
 
 def build_sp_sheet(wb_new, template_ws, rows: list[tuple[str, str, str, float | None]]):
-    """rows: list of (province, sub_specialty, code, cdcp_2026, pt_2026), excluding QC."""
+    """rows: list of (province, sub_specialty, code, cdcp_pair, pt_pair), excluding QC."""
     num_cols = 18
     ws = wb_new.create_sheet("SP")
     copy_header_rows(ws, template_ws, num_header_rows=1, num_cols=num_cols)
     style_cells = _style_row_cells(template_ws, style_row=2, num_cols=num_cols)
 
     r = 2
-    for province, sub_specialty, code, cdcp_2026, pt_2026 in rows:
-        write_row(ws, r, sp_row_values(r, province, sub_specialty, code, cdcp_2026, pt_2026), style_cells)
+    for province, sub_specialty, code, cdcp, pt in rows:
+        write_row(ws, r, sp_row_values(r, province, sub_specialty, code, cdcp, pt), style_cells)
         r += 1
 
 
-def qc_sp_row_values(r: int, sub_specialty: str, code: str, cdcp_2026, pt_2026) -> list:
+def qc_sp_row_values(r: int, sub_specialty: str, code: str, cdcp: tuple, pt: tuple) -> list:
+    """cdcp/pt are (past_year_value, current_year_value) pairs."""
+    cdcp_past, cdcp_current = cdcp
+    pt_past, pt_current = pt
     return [
         "QC",                                                 # A Province
         sub_specialty,                                        # B Specialty
         code,                                                  # C Procedure Code
         f"=C{r}&A{r}",                                         # D helper
         f"=D{r}&B{r}",                                         # E helper2
-        NA,                                                    # F 2025 CDCP Fee
-        cdcp_2026 if cdcp_2026 is not None else NA,            # G 2026 CDCP Fee (was external-workbook VLOOKUP)
-        NA,                                                    # H 2025 PT Fee
-        pt_2026 if pt_2026 is not None else NA,                # I 2026 PT Fee (was external-workbook VLOOKUP)
+        _fee(cdcp_past),                                       # F past CDCP Fee
+        _fee(cdcp_current),                                    # G current CDCP Fee (was external-workbook VLOOKUP)
+        _fee(pt_past),                                         # H past PT Fee
+        _fee(pt_current),                                      # I current PT Fee (was external-workbook VLOOKUP)
         f'=IFERROR((G{r}-F{r})/F{r},"N/A")',                   # J Unweighted Increase in CDCP Fees
         f'=IFERROR(G{r}/I{r},"")',                             # K Unweighted CDCP/PT 2026
         0,                                                      # L CDCP Claims for CDCP Fee Growth
@@ -290,36 +315,61 @@ def qc_sp_row_values(r: int, sub_specialty: str, code: str, cdcp_2026, pt_2026) 
 
 
 def build_qc_sp_sheet(wb_new, template_ws, rows: list[tuple[str, str, float | None]]):
-    """rows: list of (sub_specialty, code, cdcp_2026, pt_2026) for QC only."""
+    """rows: list of (sub_specialty, code, cdcp_pair, pt_pair) for QC only."""
     num_cols = 26
     ws = wb_new.create_sheet("QC SP")
     copy_header_rows(ws, template_ws, num_header_rows=1, num_cols=num_cols)
     style_cells = _style_row_cells(template_ws, style_row=2, num_cols=num_cols)
 
     r = 2
-    for sub_specialty, code, cdcp_2026, pt_2026 in rows:
-        write_row(ws, r, qc_sp_row_values(r, sub_specialty, code, cdcp_2026, pt_2026), style_cells)
+    for sub_specialty, code, cdcp, pt in rows:
+        write_row(ws, r, qc_sp_row_values(r, sub_specialty, code, cdcp, pt), style_cells)
         r += 1
 
 
-def dd_row_values(r: int, province: str, code: str, cdcp_prof, cdcp_lab, pt_prof, pt_lab, pt_combo) -> list:
-    cdcp_combo = None
-    if cdcp_prof is not None:
-        cdcp_combo = cdcp_prof + (cdcp_lab or 0)
+def _dd_cdcp_triple(values):
+    """(prof, lab, combo) for one year's CDCP side. Combo is prof + lab, with
+    a missing lab treated as nothing owed rather than unknown -- the same
+    convention load_cdcp_dd_fees uses."""
+    if values is None:
+        return (None, None, None)
+    prof, lab = values
+    combo = None if prof is None else prof + (lab or 0)
+    return (prof, lab, combo)
+
+
+def _dd_pt_triple(values):
+    """(prof, lab, combo) for one year's PT side, already resolved upstream
+    by fee_extraction.resolve_dd_role_values."""
+    return (None, None, None) if values is None else values
+
+
+def dd_row_values(r: int, province: str, code: str, cdcp: tuple, pt: tuple) -> list:
+    """cdcp/pt are (past_year, current_year) pairs. Each year's CDCP value is
+    a (prof, lab) pair and each PT value a (prof, lab, combo) triple, or None
+    where that year has no data."""
+    cdcp_past_prof, cdcp_past_lab, cdcp_past_combo = _dd_cdcp_triple(cdcp[0])
+    cdcp_prof, cdcp_lab, cdcp_combo = _dd_cdcp_triple(cdcp[1])
+    pt_past_prof, pt_past_lab, pt_past_combo = _dd_pt_triple(pt[0])
+    pt_prof, pt_lab, pt_combo = _dd_pt_triple(pt[1])
 
     return [
         province,                                             # A PT
         "DD",                                                 # B Specialty
         code,                                                  # C Procedure Code
         f"=C{r}&A{r}&B{r}",                                    # D helper
-        NA, NA, NA,                                            # E,F,G 2025 CDCP Prof/Lab/Combo
-        cdcp_prof if cdcp_prof is not None else NA,            # H 2026 CDCP Prof Fee
-        cdcp_lab if cdcp_lab is not None else NA,              # I 2026 CDCP Internal Lab Fee
-        cdcp_combo if cdcp_combo is not None else NA,          # J 2026 CDCP Combo Fee
-        NA, NA, NA,                                            # K,L,M 2025 PT Prof/Lab/Combo
-        pt_prof if pt_prof is not None else NA,                # N 2026 PT Prof Fee
-        pt_lab if pt_lab is not None else NA,                  # O 2026 PT Internal Lab Fee
-        pt_combo if pt_combo is not None else NA,              # P 2026 PT Combo Fee
+        _fee(cdcp_past_prof),                                  # E past CDCP Prof Fee
+        _fee(cdcp_past_lab),                                   # F past CDCP Internal Lab Fee
+        _fee(cdcp_past_combo),                                 # G past CDCP Combo Fee
+        _fee(cdcp_prof),                                       # H current CDCP Prof Fee
+        _fee(cdcp_lab),                                        # I current CDCP Internal Lab Fee
+        _fee(cdcp_combo),                                      # J current CDCP Combo Fee
+        _fee(pt_past_prof),                                    # K past PT Prof Fee
+        _fee(pt_past_lab),                                     # L past PT Internal Lab Fee
+        _fee(pt_past_combo),                                   # M past PT Combo Fee
+        _fee(pt_prof),                                         # N current PT Prof Fee
+        _fee(pt_lab),                                          # O current PT Internal Lab Fee
+        _fee(pt_combo),                                        # P current PT Combo Fee
         f'=IFERROR((H{r}-E{r})/E{r},"N/A")',                   # Q Unweighted Increase CDCP Prof
         f'=IFERROR((I{r}-F{r})/F{r},"N/A")',                   # R Unweighted Increase CDCP Lab
         f'=IFERROR((J{r}-G{r})/G{r},"N/A")',                   # S Unweighted Increase CDCP Combo
@@ -349,15 +399,16 @@ def dd_row_values(r: int, province: str, code: str, cdcp_prof, cdcp_lab, pt_prof
 
 
 def build_dd_sheet(wb_new, template_ws, rows: list[tuple[str, str, tuple, tuple]]):
-    """rows: list of (province, code, (cdcp_prof, cdcp_lab), (pt_prof, pt_lab, pt_combo))."""
+    """rows: list of (province, code, cdcp_pair, pt_pair) where each pair is
+    (past_year_value, current_year_value)."""
     num_cols = 43
     ws = wb_new.create_sheet("DD")
     copy_header_rows(ws, template_ws, num_header_rows=2, num_cols=num_cols)
     style_cells = _style_row_cells(template_ws, style_row=3, num_cols=num_cols)
 
     r = 3
-    for province, code, (cdcp_prof, cdcp_lab), (pt_prof, pt_lab, pt_combo) in rows:
-        write_row(ws, r, dd_row_values(r, province, code, cdcp_prof, cdcp_lab, pt_prof, pt_lab, pt_combo), style_cells)
+    for province, code, cdcp, pt in rows:
+        write_row(ws, r, dd_row_values(r, province, code, cdcp, pt), style_cells)
         r += 1
 
 
