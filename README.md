@@ -181,19 +181,6 @@ gap is shown as a gap on purpose, so nothing invented reaches the output.
 Rows are the union of both years, so a code the CDCP only started listing in
 the newer year still appears, with the older year shown for comparison.
 
-## Known gaps
-
-These are deliberate, and unchanged from previous builds:
-
-- **Claim counts are written as `0`.** The CDCP files don't carry claim
-  counts. The weighting formulas are written and ready, so dropping real
-  counts in later makes the workbook calculate correctly with no code change.
-- **QC GP / QC SP fee columns are plain numbers, not formulas.** The template
-  had formulas pointing at linked workbooks we don't have; those are replaced
-  with the extracted values.
-- **GP's last column** was already a broken `#REF!` in the template. It is
-  replaced with a working equivalent.
-
 ## If something goes wrong
 
 | What you see | What to do |
